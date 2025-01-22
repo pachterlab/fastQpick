@@ -184,7 +184,7 @@ def test_single_file(temp_fastq_file):
     fraction = 0.6
     seed = 42
     gzip_output = False
-    paired = False
+    group_size = 1
     replacement = False
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
@@ -192,22 +192,21 @@ def test_single_file(temp_fastq_file):
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
-                threads=1,
                 gzip_output=gzip_output,
-                paired=paired,
+                group_size=group_size,
                 replacement=replacement,
                 overwrite=True
                 )
         
         run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-        st()
+        # st()
 
 def test_single_file_bootstrapped(temp_fastq_file):
     fraction = 1
     seed = 42
     gzip_output = False
-    paired = False
+    group_size = 1
     replacement = True
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
@@ -215,22 +214,21 @@ def test_single_file_bootstrapped(temp_fastq_file):
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
-                threads=1,
                 gzip_output=gzip_output,
-                paired=paired,
+                group_size=group_size,
                 replacement=replacement,
                 overwrite=True
                 )
         
         run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-        st()
+        # st()
 
 def test_single_file_oversampled(temp_fastq_file):
     fraction = 3
     seed = 42
     gzip_output = False
-    paired = False
+    group_size = 1
     replacement = True
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
@@ -238,22 +236,21 @@ def test_single_file_oversampled(temp_fastq_file):
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
-                threads=1,
                 gzip_output=gzip_output,
-                paired=paired,
+                group_size=group_size,
                 replacement=replacement,
                 overwrite=True
                 )
         
         run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-        st()
+        # st()
         
 def test_single_gzipped(temp_fastq_file):
     fraction = 0.6
     seed = 42
     gzip_output = True
-    paired = False
+    group_size = 1
     replacement = False
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
@@ -261,23 +258,22 @@ def test_single_gzipped(temp_fastq_file):
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
-                threads=1,
                 gzip_output=gzip_output,
-                paired=paired,
+                group_size=group_size,
                 replacement=replacement,
                 overwrite=True
                 )
         
         run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-        st()
+        # st()
 
 
 def test_paired_files(temp_paired_fastq_files):
     fraction = 0.75
     seed = 42
     gzip_output = False
-    paired = False
+    group_size = 2
     replacement = False
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
@@ -285,9 +281,8 @@ def test_paired_files(temp_paired_fastq_files):
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
-                threads=1,
                 gzip_output=gzip_output,
-                paired=paired,
+                group_size=group_size,
                 replacement=replacement,
                 overwrite=True
                 )
@@ -297,13 +292,13 @@ def test_paired_files(temp_paired_fastq_files):
 
         check_pairwise_agreement(temp_paired_fastq_files=temp_paired_fastq_files, temp_output_dir=temp_output_dir, gzip_output=gzip_output)
 
-        st()
+        # st()
 
 def test_paired_files_bootstrapped(temp_paired_fastq_files):
     fraction = 1
     seed = 42
     gzip_output = False
-    paired = False
+    group_size = 2
     replacement = True
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
@@ -311,9 +306,8 @@ def test_paired_files_bootstrapped(temp_paired_fastq_files):
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
-                threads=1,
                 gzip_output=gzip_output,
-                paired=paired,
+                group_size=group_size,
                 replacement=replacement,
                 overwrite=True
                 )
@@ -323,4 +317,4 @@ def test_paired_files_bootstrapped(temp_paired_fastq_files):
 
         check_pairwise_agreement(temp_paired_fastq_files=temp_paired_fastq_files, temp_output_dir=temp_output_dir, gzip_output=gzip_output)
 
-        st()
+        # st()

@@ -1,5 +1,4 @@
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import gzip
 import os
 import random
@@ -7,12 +6,11 @@ from tqdm import tqdm
 import pyfastx  # to loop through fastq (faster than custom python code)
 
 from fastQpick._version import __version__
-from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, pair_items, count_reads
+from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, group_items, count_reads
 
 # Global variables
 valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
-use_buffer = True
-batch_size = 100000
+batch_size = 100000  # for buffer
 fastq_to_length_dict = {}  # set to empty, and the user can provide otherwise it will be calculated
 
 def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, verbose = True):
@@ -33,27 +31,20 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
         if verbose else input_fastq_read_only
     )
 
-    if use_buffer:
-        with open_func(output_path, write_mode) as f:
-            for i, (name, seq, qual) in enumerate(iterator):
-                # Add the FASTQ entry to the buffer
-                buffer.extend([f"@{name}\n{seq}\n+\n{qual}\n"] * occurrence_list[i])
-                
-                # If the buffer reaches the batch size, write all at once and clear the buffer
-                if (i + 1) % batch_size == 0:
-                    f.writelines(buffer)
-                    buffer.clear()  # Clear the buffer after writing
+    with open_func(output_path, write_mode) as f:
+        for i, (name, seq, qual) in enumerate(iterator):
+            # Add the FASTQ entry to the buffer
+            buffer.extend([f"@{name}\n{seq}\n+\n{qual}\n"] * occurrence_list[i])
             
-            # Write any remaining entries in the buffer
-            if buffer:
+            # If the buffer reaches the batch size, write all at once and clear the buffer
+            if (i + 1) % batch_size == 0:
                 f.writelines(buffer)
-                buffer.clear()
-    else:
-        with open_func(output_path, write_mode) as f:
-            for i, (name, seq, qual) in enumerate(iterator):
-                f.writelines(
-                    f"@{name}\n{seq}\n+\n{qual}\n" * occurrence_list[i]
-                )
+                buffer.clear()  # Clear the buffer after writing
+        
+        # Write any remaining entries in the buffer
+        if buffer:
+            f.writelines(buffer)
+            buffer.clear()
 
 def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, verbose):
     if replacement:
@@ -78,100 +69,46 @@ def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, rep
 
     return occurrence_list
 
-def bootstrap_single_file(file = None, file1 = None, file2 = None, gzip_output = None, output_path = None, output_path1 = None, output_path2 = None, seed = None, fraction = None, replacement = None, verbose=True):
-    # Create output directory if it doesn't exist
-    output_path_args = [output_path, output_path1, output_path2]
-    for output_path_arg in output_path_args:
-        if output_path_arg and os.path.dirname(output_path_arg):
-            os.makedirs(os.path.dirname(output_path_arg), exist_ok=True)
+def bootstrap_single_file(files_total = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, verbose=True):
+    if isinstance(files_total, str):
+        files_total = (files_total, )
 
-    if file:
-        if not output_path:
-            output_path = file.replace(".fastq", f"_bootstrapped_seed{seed}.fastq").replace(".fq", f"_bootstrapped_seed{seed}.fq")
+    if verbose:
+        print(f"Calculating total reads and determining random indices for seed {seed}, file {files_total[0]}")
+    total_reads = fastq_to_length_dict[files_total[0]]
+    number_of_reads_to_sample = int(fraction * total_reads)
+
+    occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, verbose=verbose)
+    
+    for file in files_total:
+        # Create output directory if it doesn't exist
+        output_path = os.path.join(output_directory, os.path.basename(file))
+        if output_directory:
+            os.makedirs(output_directory, exist_ok=True)
+
         if gzip_output and not output_path.endswith(".gz"):
             output_path += ".gz"
-
-        if verbose:
-            print(f"Calculating total reads and determining random indices for seed {seed}, file {file}")
-        total_reads = fastq_to_length_dict[file]
-        number_of_reads_to_sample = int(fraction * total_reads)
-
-        occurrence_list = make_occurrence_list(file=file, seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, verbose=verbose)
 
         # write fastq
         write_fastq(input_fastq = file, output_path = output_path, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, verbose = verbose)
 
-    elif file1 and file2:
-        if not output_path1:
-            output_path1 = file1.replace(".fastq", f"_bootstrapped_seed{seed}.fastq").replace(".fq", f"_bootstrapped_seed{seed}.fq")
-        if gzip_output and not output_path1.endswith(".gz"):
-            output_path1 += ".gz"
-        if not output_path2:
-            output_path2 = file.replace(".fastq", f"_bootstrapped_seed{seed}.fastq").replace(".fq", f"_bootstrapped_seed{seed}.fq")
-        if gzip_output and not output_path2.endswith(".gz"):
-            output_path2 += ".gz"
-                
-        # Paired-end FASTQ files
-        if verbose:
-            print(f"Calculating total reads and determining random indices for seed {seed}, file {file1}")
-        total_reads = fastq_to_length_dict[file1]
-        number_of_reads_to_sample = int(fraction * total_reads)
-
-        occurrence_list = make_occurrence_list(file=file1, seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, verbose=verbose)
-
-        # TODO: multithread this
-        # write fastqs
-        write_fastq(input_fastq = file1, output_path = output_path1, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, verbose = verbose)
-        write_fastq(input_fastq = file2, output_path = output_path2, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, verbose = verbose)
-
-    else:
-        raise ValueError("You must provide either a single FASTQ file or paired-end FASTQ files.")
-
-
-def process_seed_and_file(seed, file, fraction, gzip_output, replacement, output_directory, verbose):
-    random.seed(seed)
-    # print(f"seed {seed}, file {file}")
-    if isinstance(file, tuple):
-        assert len(file) == 2, "Paired-end FASTQ files must be a 2-tuple."
-        output_path1 = os.path.join(output_directory, os.path.basename(file[0]))
-        output_path2 = os.path.join(output_directory, os.path.basename(file[1]))
-        bootstrap_single_file(file1 = file[0], file2 = file[1], gzip_output = gzip_output, output_path = None, output_path1 = output_path1, output_path2 = output_path2, seed = seed, fraction = fraction, replacement = replacement, verbose = verbose)
-    elif isinstance(file, str):
-        output_path = os.path.join(output_directory, os.path.basename(file))
-        bootstrap_single_file(file = file, gzip_output = gzip_output, output_path = output_path, seed = seed, fraction = fraction, replacement = replacement, verbose = verbose)
-
-def sample_multiple_files(file_list, fraction, seed_list, output, threads, gzip_output, replacement, verbose):
-    # Use ThreadPoolExecutor to process seeds in parallel
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        # Submit tasks for all combinations of seeds and files
-        futures = [
-            executor.submit(
-                process_seed_and_file,
-                seed,
-                file,
-                fraction,
-                gzip_output,
-                replacement,
-                output,
-                verbose
-            )
-            for seed in seed_list
-            for file in file_list
-        ]
-
-# TODO: multithread across file list    
+def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, verbose):
+    for seed in seed_list:
+        random.seed(seed)
+        for file in file_list:
+            bootstrap_single_file(files_total = file, gzip_output = gzip_output, output_directory = output, seed = seed, fraction = fraction, replacement = replacement, verbose = verbose)
+    
 def make_fastq_to_length_dict(file_list, verbose=True):
     global fastq_to_length_dict
     for file in file_list:
         if isinstance(file, tuple):
-            assert len(file) == 2, "Paired-end FASTQ files must be a 2-tuple."
-            if file[0] in fastq_to_length_dict and file[1] in fastq_to_length_dict:
+            if all(specific_file in fastq_to_length_dict for specific_file in file):
                 continue
             if verbose:
                 print(f"Counting {file[0]}")
             count = count_reads(file[0])
-            fastq_to_length_dict[file[0]] = count
-            fastq_to_length_dict[file[1]] = count
+            for i in range(len(file)):
+                fastq_to_length_dict[file[i]] = count
         elif isinstance(file, str):
             if file in fastq_to_length_dict:
                 continue
@@ -182,26 +119,25 @@ def make_fastq_to_length_dict(file_list, verbose=True):
     if verbose:
         print("fastq_to_length_dict:", fastq_to_length_dict)
 
-def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output", threads=1, gzip_output=False, paired=False, replacement=False, overwrite=False, verbose=True, **kwargs):
+def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output", gzip_output=False, group_size=1, replacement=False, overwrite=False, verbose=True, **kwargs):
     """
     Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement.
 
     Parameters
     ----------
-    input_file_list (list)      List of input FASTQ files or directories containing FASTQ files.
-    fraction (int or float)     The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.
-    seed (int or str)           Random seed(s). Can provide multiple seeds separated by commas. Default: 42
-    output_dir (str)            Output directory. Default: ./fastQpick_output
-    threads (int)               Number of threads. Default: 2
-    gzip_output (bool)          Whether or not to gzip the output. Default: False (uncompressed)
-    paired (bool)               Whether or not the fastq files are paired-end. If paired-end, provide each pair of files sequentially, separated by a space. Default: False
-    replacement (bool)          Sample with replacement. Default: False (without replacement).
-    overwrite (bool)            Overwrite existing output files. Default: False
-    verbose (bool)              Whether to print progress information. Default: True
+    input_file_list (list, str, or tuple)   List of input FASTQ files or directories containing FASTQ files.
+    fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.
+    seed (int or str)                       Random seed(s). Can provide multiple seeds separated by commas. Default: 42
+    output_dir (str)                        Output directory. Default: ./fastQpick_output
+    gzip_output (bool)                      Whether or not to gzip the output. Default: False (uncompressed)
+    group_size (bool)                       The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)
+    replacement (bool)                      Sample with replacement. Default: False (without replacement).
+    overwrite (bool)                        Overwrite existing output files. Default: False
+    verbose (bool)                          Whether to print progress information. Default: True
 
     kwargs
     ------
-    fastq_to_length_dict (dict) Dictionary of FASTQ file paths to number of reads in each file. If not provided, will be calculated.
+    fastq_to_length_dict (dict)             Dictionary of FASTQ file paths to number of reads in each file. If not provided, will be calculated.
     """
     # check if fastq_to_length_dict is in kwargs
     if "fastq_to_length_dict" in kwargs and isinstance(kwargs["fastq_to_length_dict"], dict):
@@ -252,14 +188,14 @@ def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output",
     elif isinstance(seed, str):  # if a string of comma-separated ints is passed as a seed (like on the command line)
         seed = [int(specific_seed) for specific_seed in seed.split(",")]
 
-    if paired:
-        input_file_list_parsed = pair_items(input_file_list_parsed)
+    if group_size > 1:
+        input_file_list_parsed = group_items(input_file_list_parsed, group_size=group_size)
     
     # Count reads in each file and store in a dictionary
     make_fastq_to_length_dict(input_file_list_parsed, verbose=verbose)
 
     # Do the sampling
-    sample_multiple_files(file_list=input_file_list_parsed, fraction=fraction, seed_list=seed, output=output_dir, threads=threads, gzip_output=gzip_output, replacement=replacement, verbose=verbose)
+    sample_multiple_files(file_list=input_file_list_parsed, fraction=fraction, seed_list=seed, output=output_dir, gzip_output=gzip_output, replacement=replacement, verbose=verbose)
 
 def main():
     # Create argument parser
@@ -267,9 +203,8 @@ def main():
     parser.add_argument("-f", "--fraction", required=True, default=False, help="The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.")
     parser.add_argument("-s", "--seed", required=False, default=42, help="Random seed(s). Can provide multiple seeds separated by commas. Default: 42")
     parser.add_argument("-o", "--output_dir", required=False, type=str, default="fastQpick_output", help="Output file path. Default: ./fastQpick_output")
-    parser.add_argument("-t", "--threads", required=False, type=int, default=1, help="Number of threads. Default: 2")
     parser.add_argument("-z", "--gzip_output", required=False, default=False, help="Whether or not to gzip the output. Default: False (uncompressed)")
-    parser.add_argument("-p", "--paired", required=False, default=False, help="Whether or not the fastq files are paired-end. If paired-end, provide each pair of files sequentially, separated by a space. Default: False")
+    parser.add_argument("-g", "--group_size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)")
     parser.add_argument("-r", "--replacement", required=False, default=False, help="Sample with replacement. Default: False (without replacement).")
     parser.add_argument("-w", "--overwrite", required=False, default=False, help="Overwrite existing output files. Default: False")
     parser.add_argument("-q", "--quiet", required=False, default=False, help="Turn off verbose output. Default: False")
@@ -286,8 +221,7 @@ def main():
               fraction=args.fraction,
               seed=args.seed,
               output=args.output_dir,
-              threads=args.threads,
               gzip_output=args.gzip_output,
-              paired=args.paired,
+              group_size=args.group_size,
               replacement=args.replacement,
               verbose=verbose)

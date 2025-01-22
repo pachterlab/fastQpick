@@ -96,7 +96,7 @@ def is_directory_effectively_empty(directory_path):
     ]
     return len(entries) == 0
 
-def pair_items(file_list):
-    if len(file_list) % 2 != 0:
-        raise ValueError("The list length must be even to form pairs.")
-    return list(zip(file_list[::2], file_list[1::2]))
+def group_items(file_list, group_size=2):
+    if len(file_list) % group_size != 0:
+        raise ValueError(f"The list length must be divisible by {group_size} to form groups.")
+    return [tuple(file_list[i:i + group_size]) for i in range(0, len(file_list), group_size)]
