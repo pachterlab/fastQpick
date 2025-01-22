@@ -84,7 +84,7 @@ fastQpick(
 - Works with both single and paired-end sequencing data.
 - Supports sampling with or without replacement.
 - Command-line interface and Python API for seamless integration.
-- Memory efficient - in low-memory mode, only uses as much memory as a list of integers the length of the number of reads in the fastq file for each file.
+- Memory efficient - in low-memory mode, only uses as much memory as a list of (small) integers the length of the number of reads in the fastq file for each file.
 - Time efficient - only passes through the fastq once and writes to output in batches - can process 600M reads in 10-15 minutes
 
 ## Low memory mode vs. standard
