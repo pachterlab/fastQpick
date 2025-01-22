@@ -10,7 +10,7 @@ from fastQpick.utils import save_params_to_config_file, is_directory_effectively
 
 # Global variables
 valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
-batch_size = 100000  # for buffer
+batch_size = 200000  # for buffer
 fastq_to_length_dict = {}  # set to empty, and the user can provide otherwise it will be calculated
 
 def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, verbose = True):
@@ -127,10 +127,10 @@ def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output",
     ----------
     input_file_list (list, str, or tuple)   List of input FASTQ files or directories containing FASTQ files.
     fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.
-    seed (int or str)                       Random seed(s). Can provide multiple seeds separated by commas. Default: 42
+    seed (int)                              Random seed(s). Can provide multiple seeds separated by commas. Default: 42
     output_dir (str)                        Output directory. Default: ./fastQpick_output
     gzip_output (bool)                      Whether or not to gzip the output. Default: False (uncompressed)
-    group_size (bool)                       The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)
+    group_size (int)                        The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)
     replacement (bool)                      Sample with replacement. Default: False (without replacement).
     overwrite (bool)                        Overwrite existing output files. Default: False
     verbose (bool)                          Whether to print progress information. Default: True
@@ -188,6 +188,9 @@ def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output",
     elif isinstance(seed, str):  # if a string of comma-separated ints is passed as a seed (like on the command line)
         seed = [int(specific_seed) for specific_seed in seed.split(",")]
 
+    group_size = int(group_size)  # make sure group_size is an int (not a string)
+    fraction = float(fraction)  # make sure fraction is a float (not a string)
+
     if group_size > 1:
         input_file_list_parsed = group_items(input_file_list_parsed, group_size=group_size)
     
@@ -205,9 +208,9 @@ def main():
     parser.add_argument("-o", "--output_dir", required=False, type=str, default="fastQpick_output", help="Output file path. Default: ./fastQpick_output")
     parser.add_argument("-z", "--gzip_output", required=False, default=False, help="Whether or not to gzip the output. Default: False (uncompressed)")
     parser.add_argument("-g", "--group_size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)")
-    parser.add_argument("-r", "--replacement", required=False, default=False, help="Sample with replacement. Default: False (without replacement).")
-    parser.add_argument("-w", "--overwrite", required=False, default=False, help="Overwrite existing output files. Default: False")
-    parser.add_argument("-q", "--quiet", required=False, default=False, help="Turn off verbose output. Default: False")
+    parser.add_argument("-r", "--replacement", action="store_true", help="Sample with replacement. Default: False (without replacement).")
+    parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files. Default: False")
+    parser.add_argument("-q", "--quiet", action="store_false", help="Turn off verbose output. Default: False")
     parser.add_argument("-v", "--version", action="version", version=f"fastQpick {__version__}", help="Show program's version number and exit")
 
     # Positional argument for input files (indefinite number)
@@ -215,13 +218,13 @@ def main():
 
     # Parse arguments
     args = parser.parse_args()
-    verbose = not args.quiet
             
-    fastQpick(input_file_list=args,
+    fastQpick(input_file_list=args.input_file_list,
               fraction=args.fraction,
               seed=args.seed,
-              output=args.output_dir,
+              output_dir=args.output_dir,
               gzip_output=args.gzip_output,
               group_size=args.group_size,
               replacement=args.replacement,
-              verbose=verbose)
+              overwrite=args.overwrite,
+              verbose=args.quiet)
