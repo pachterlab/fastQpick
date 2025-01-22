@@ -124,10 +124,21 @@ def make_fastq_dict(file_path):
         fastq_dict[header]["quality"] = qual
     return fastq_dict
 
-def check_pairwise_agreement(file1, file2):
+        
+def check_pairwise_agreement(temp_paired_fastq_files, temp_output_dir, gzip_output):
+    file1_base_name = os.path.basename(temp_paired_fastq_files[0])
+    file2_base_name = os.path.basename(temp_paired_fastq_files[1])
+    
+    output_fastq_file1 = os.path.join(temp_output_dir, file1_base_name)
+    output_fastq_file2 = os.path.join(temp_output_dir, file2_base_name)
+
+    if gzip_output:
+        output_fastq_file1 += ".gz"
+        output_fastq_file2 += ".gz"
+
     for (header1, seq1, plus_line1, qual1), (header2, seq2, plus_line2, qual2) in zip(
-        read_fastq(file1, include_plus_line=True), 
-        read_fastq(file2, include_plus_line=True)
+        read_fastq(output_fastq_file1, include_plus_line=True), 
+        read_fastq(output_fastq_file2, include_plus_line=True)
     ):
         # Split headers up to the last underscore
         split_header1 = header1.rsplit('_', 1)[0]
@@ -169,8 +180,6 @@ def run_all_single_file_tests(temp_output_dir, temp_fastq_file, gzip_output, fra
         if replacement and fraction > 1:
             assert num_unique_reads < num_reads_output, f"Number of unique reads mismatch - expected: less than {num_reads_output}; got: {num_unique_reads}"
 
-        # st()
-
 def test_single_file(temp_fastq_file):
     fraction = 0.6
     seed = 42
@@ -191,6 +200,8 @@ def test_single_file(temp_fastq_file):
                 )
         
         run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
+
+        st()
 
 def test_single_file_bootstrapped(temp_fastq_file):
     fraction = 1
@@ -213,6 +224,8 @@ def test_single_file_bootstrapped(temp_fastq_file):
         
         run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
+        st()
+
 def test_single_file_oversampled(temp_fastq_file):
     fraction = 3
     seed = 42
@@ -233,6 +246,8 @@ def test_single_file_oversampled(temp_fastq_file):
                 )
         
         run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
+
+        st()
         
 def test_single_gzipped(temp_fastq_file):
     fraction = 0.6
@@ -253,9 +268,9 @@ def test_single_gzipped(temp_fastq_file):
                 overwrite=True
                 )
         
-        st()
-        
         run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
+
+        st()
 
 
 def test_paired_files(temp_paired_fastq_files):
@@ -280,7 +295,9 @@ def test_paired_files(temp_paired_fastq_files):
         for fastq_file in temp_paired_fastq_files:
             run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-        check_pairwise_agreement(temp_paired_fastq_files[0], temp_paired_fastq_files[1])
+        check_pairwise_agreement(temp_paired_fastq_files=temp_paired_fastq_files, temp_output_dir=temp_output_dir, gzip_output=gzip_output)
+
+        st()
 
 def test_paired_files_bootstrapped(temp_paired_fastq_files):
     fraction = 1
@@ -304,14 +321,6 @@ def test_paired_files_bootstrapped(temp_paired_fastq_files):
         for fastq_file in temp_paired_fastq_files:
             run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-        file1_base_name = os.path.basename(temp_paired_fastq_files[0])
-        file2_base_name = os.path.basename(temp_paired_fastq_files[1])
-        
-        output_fastq_file1 = os.path.join(temp_output_dir, file1_base_name)
-        output_fastq_file2 = os.path.join(temp_output_dir, file2_base_name)
+        check_pairwise_agreement(temp_paired_fastq_files=temp_paired_fastq_files, temp_output_dir=temp_output_dir, gzip_output=gzip_output)
 
-        if gzip_output:
-            output_fastq_file1 += ".gz"
-            output_fastq_file2 += ".gz"
-        
-        check_pairwise_agreement(output_fastq_file1, output_fastq_file2)
+        st()

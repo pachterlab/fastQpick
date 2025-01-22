@@ -5,48 +5,23 @@ import os
 import random
 from tqdm import tqdm
 import pyfastx  # to loop through fastq (faster than custom python code)
-from pysam import BGZFile  # to write to BGZF gzip files
 
+from fastQpick._version import __version__
 from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, pair_items, count_reads
 
 # Global variables
 valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 use_buffer = True
 batch_size = 100000
-use_bgzf = True  # False to use regular gzip
 fastq_to_length_dict = {}  # set to empty, and the user can provide otherwise it will be calculated
-
-def write_bgzf_without_buffer(f, name, seq, qual, occurrences):
-    """Writes to a BGZF file."""
-    # Join and encode the multiplied string
-    f.write((f"@{name}\n{seq}\n+\n{qual}\n" * occurrences).encode("utf-8"))
-
-def write_plain_without_buffer(f, name, seq, qual, occurrences):
-    """Writes to a plain text file."""
-    # Write directly using writelines
-    f.writelines(f"@{name}\n{seq}\n+\n{qual}\n" * occurrences)
-
-def write_bgzf(f, buffer):
-    """Writes the buffer to a BGZF file."""
-    f.write("".join(buffer).encode("utf-8"))
-
-def write_plain(f, buffer):
-    """Writes the buffer to a plain text file."""
-    f.writelines(buffer)
 
 def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, verbose = True):
     if gzip_output:
-        global use_bgzf
-        open_func = BGZFile if use_bgzf else gzip.open
-        write_mode = "wb" if use_bgzf else "wt"
-        if use_buffer:
-            write_func = write_bgzf if use_bgzf else write_plain
-        else:
-            write_func = write_bgzf_without_buffer if use_bgzf else write_plain_without_buffer
+        open_func = gzip.open
+        write_mode = "wt"
     else:
         open_func = open
         write_mode = "w"
-        write_func = write_plain if use_buffer else write_plain_without_buffer
     
     buffer = []  # Temporary storage for the batch
 
@@ -66,7 +41,7 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
                 
                 # If the buffer reaches the batch size, write all at once and clear the buffer
                 if (i + 1) % batch_size == 0:
-                    write_func(f, buffer)
+                    f.writelines(buffer)
                     buffer.clear()  # Clear the buffer after writing
             
             # Write any remaining entries in the buffer
@@ -76,7 +51,9 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
     else:
         with open_func(output_path, write_mode) as f:
             for i, (name, seq, qual) in enumerate(iterator):
-                write_func(f, name, seq, qual, occurrence_list[i])
+                f.writelines(
+                    f"@{name}\n{seq}\n+\n{qual}\n" * occurrence_list[i]
+                )
 
 def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, verbose):
     if replacement:
@@ -225,7 +202,6 @@ def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output",
     kwargs
     ------
     fastq_to_length_dict (dict) Dictionary of FASTQ file paths to number of reads in each file. If not provided, will be calculated.
-    use_bgzf (bool)             Use BGZF compression for gzip output. Default: True
     """
     # check if fastq_to_length_dict is in kwargs
     if "fastq_to_length_dict" in kwargs and isinstance(kwargs["fastq_to_length_dict"], dict):
@@ -297,6 +273,7 @@ def main():
     parser.add_argument("-r", "--replacement", required=False, default=False, help="Sample with replacement. Default: False (without replacement).")
     parser.add_argument("-w", "--overwrite", required=False, default=False, help="Overwrite existing output files. Default: False")
     parser.add_argument("-q", "--quiet", required=False, default=False, help="Turn off verbose output. Default: False")
+    parser.add_argument("-v", "--version", action="version", version=f"fastQpick {__version__}", help="Show program's version number and exit")
 
     # Positional argument for input files (indefinite number)
     parser.add_argument("input_file_list", nargs="+", help="Input FASTQ file(s) (one after the other, space-separated) or FASTQ folder(s)")

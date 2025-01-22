@@ -32,7 +32,6 @@ classifiers = [
 dependencies = [
     "pyfastx>=2.0.0",
     "tqdm>=4.66.0",
-    "pysam>=0.22.0",
 ]
 
 [project.urls]
