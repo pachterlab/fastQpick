@@ -87,6 +87,11 @@ fastQpick(
 - Memory efficient - in low-memory mode, only uses as much memory as a list of integers the length of the number of reads in the fastq file for each file.
 - Time efficient - only passes through the fastq once and writes to output in batches - can process 600M reads in 10-15 minutes
 
+## Low memory mode vs. standard
+Low memory mode vs. standard, when fraction=1 (i.e., number of reads to sample is the same as the number of reads in the fastq):
+- Adds an extra ~1-3 seconds per million reads per group_size (i.e., 500M reads would take 30 minutes instead of 20-25 minutes)
+- Saves an extra ~40MB RAM per million reads (i.e., 500M reads would take 3.75GB RAM vs 20.6GB RAM)
+
 ---
 
 ## Examples
