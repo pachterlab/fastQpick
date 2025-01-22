@@ -88,6 +88,8 @@ def bootstrap_single_file(files_total = None, gzip_output = None, output_directo
 
         if gzip_output and not output_path.endswith(".gz"):
             output_path += ".gz"
+        elif not gzip_output and output_path.endswith(".gz"):
+            output_path = output_path[:-3]
 
         # write fastq
         write_fastq(input_fastq = file, output_path = output_path, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, verbose = verbose)
