@@ -137,7 +137,7 @@ fastQpick(
 
 ## License
 
-fastQpick is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+fastQpick is licensed under the 2-clause BSD license. See the [LICENSE](LICENSE) file for details.
 
 ---
 
