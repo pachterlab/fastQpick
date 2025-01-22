@@ -188,7 +188,7 @@ def test_single_file(temp_fastq_file):
     replacement = False
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_file_list=temp_fastq_file,
+        fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
@@ -210,7 +210,7 @@ def test_single_file_bootstrapped(temp_fastq_file):
     replacement = True
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_file_list=temp_fastq_file,
+        fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
@@ -232,7 +232,7 @@ def test_single_file_oversampled(temp_fastq_file):
     replacement = True
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_file_list=temp_fastq_file,
+        fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
@@ -254,7 +254,7 @@ def test_single_gzipped(temp_fastq_file):
     replacement = False
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_file_list=temp_fastq_file,
+        fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
@@ -277,7 +277,7 @@ def test_paired_files(temp_paired_fastq_files):
     replacement = False
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_file_list=temp_paired_fastq_files,
+        fastQpick(input_files=temp_paired_fastq_files,
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,
@@ -302,7 +302,7 @@ def test_paired_files_bootstrapped(temp_paired_fastq_files):
     replacement = True
     
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_file_list=temp_paired_fastq_files,
+        fastQpick(input_files=temp_paired_fastq_files,
                 fraction=fraction,
                 seed=seed,
                 output_dir=temp_output_dir,

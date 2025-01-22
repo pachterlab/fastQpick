@@ -46,11 +46,19 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
             f.writelines(buffer)
             buffer.clear()
 
-def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, verbose):
+def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, low_memory, verbose):
+    if verbose:
+        print(f"Calculating total reads and determining random indices for seed {seed}, file {file}")
     if replacement:
-        random_indices = random.choices(range(total_reads), k=number_of_reads_to_sample)  # with replacement
+        if low_memory:
+            random_indices = (random.choice(range(total_reads)) for _ in range(number_of_reads_to_sample))
+        else:
+            random_indices = tuple(random.choices(range(total_reads), k=number_of_reads_to_sample))  # with replacement
     else:
-        random_indices = random.sample(range(total_reads), k=number_of_reads_to_sample)  # without replacement
+        if low_memory:
+            random_indices = (index for index in random.sample(range(total_reads), k=number_of_reads_to_sample))
+        else:
+            random_indices = tuple(random.sample(range(total_reads), k=number_of_reads_to_sample))  # without replacement
 
     # Initialize a list with zeros
     occurrence_list = [0] * total_reads
@@ -69,16 +77,14 @@ def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, rep
 
     return occurrence_list
 
-def bootstrap_single_file(files_total = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, verbose=True):
+def bootstrap_single_file(files_total = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, low_memory = False, verbose=True):
     if isinstance(files_total, str):
         files_total = (files_total, )
 
-    if verbose:
-        print(f"Calculating total reads and determining random indices for seed {seed}, file {files_total[0]}")
     total_reads = fastq_to_length_dict[files_total[0]]
     number_of_reads_to_sample = int(fraction * total_reads)
 
-    occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, verbose=verbose)
+    occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, low_memory=low_memory, verbose=verbose)
     
     for file in files_total:
         # Create output directory if it doesn't exist
@@ -94,11 +100,11 @@ def bootstrap_single_file(files_total = None, gzip_output = None, output_directo
         # write fastq
         write_fastq(input_fastq = file, output_path = output_path, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, verbose = verbose)
 
-def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, verbose):
+def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, verbose):
     for seed in seed_list:
         random.seed(seed)
         for file in file_list:
-            bootstrap_single_file(files_total = file, gzip_output = gzip_output, output_directory = output, seed = seed, fraction = fraction, replacement = replacement, verbose = verbose)
+            bootstrap_single_file(files_total = file, gzip_output = gzip_output, output_directory = output, seed = seed, fraction = fraction, replacement = replacement, low_memory = low_memory, verbose = verbose)
     
 def make_fastq_to_length_dict(file_list, verbose=True):
     global fastq_to_length_dict
@@ -121,20 +127,21 @@ def make_fastq_to_length_dict(file_list, verbose=True):
     if verbose:
         print("fastq_to_length_dict:", fastq_to_length_dict)
 
-def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output", gzip_output=False, group_size=1, replacement=False, overwrite=False, verbose=True, **kwargs):
+def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzip_output=False, group_size=1, replacement=False, overwrite=False, low_memory=False, verbose=True, **kwargs):
     """
     Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement.
 
     Parameters
     ----------
-    input_file_list (list, str, or tuple)   List of input FASTQ files or directories containing FASTQ files.
+    input_files (str, list, or tuple)       List of input FASTQ files or directories containing FASTQ files.
     fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.
-    seed (int)                              Random seed(s). Can provide multiple seeds separated by commas. Default: 42
+    seed (int or str)                       Random seed(s). Can provide multiple seeds separated by commas. Default: 42
     output_dir (str)                        Output directory. Default: ./fastQpick_output
     gzip_output (bool)                      Whether or not to gzip the output. Default: False (uncompressed)
     group_size (int)                        The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)
     replacement (bool)                      Sample with replacement. Default: False (without replacement).
     overwrite (bool)                        Overwrite existing output files. Default: False
+    low_memory (bool)                       Whether to use low memory mode (uses ~5.5x less memory than default, but adds marginal time to the data structure generation preprocessing). Default: False
     verbose (bool)                          Whether to print progress information. Default: True
 
     kwargs
@@ -162,11 +169,11 @@ def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output",
         replacement = True
 
     # go through files, and only keep those that are valid fastq files or that are a folder containing valid fastq files in the direct subdirectory
-    input_file_list_parsed = []
-    if isinstance(input_file_list, str):
-        input_file_list_parsed = [input_file_list]
-    elif isinstance(input_file_list, tuple) or isinstance(input_file_list, list):
-        for path in input_file_list:
+    input_files_parsed = []
+    if isinstance(input_files, str):
+        input_files_parsed = [input_files]
+    elif isinstance(input_files, tuple) or isinstance(input_files, list):
+        for path in input_files:
             if not isinstance(path, str):
                 raise ValueError("Input file list must be a string, tuple of strings, or list of strings.")
             if not os.path.exists(path):
@@ -174,14 +181,14 @@ def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output",
             elif os.path.isfile(path) and not path.endswith(tuple(valid_fastq_extensions)):
                 raise ValueError(f"File '{path}' is not a valid FASTQ file.")
             elif os.path.isdir(path):
-                input_files_before_path = input_file_list_parsed.copy()
+                input_files_before_path = input_files_parsed.copy()
                 for subpath in os.listdir(path):
                     if os.path.isfile(subpath) and subpath.endswith(tuple(valid_fastq_extensions)):
-                        input_file_list_parsed.append(subpath)
-                if input_files_before_path == input_file_list_parsed:
+                        input_files_parsed.append(subpath)
+                if input_files_before_path == input_files_parsed:
                     raise ValueError(f"No valid FASTQ files found in directory '{path}'.")
             elif os.path.isfile(path) and path.endswith(tuple(valid_fastq_extensions)):
-                input_file_list_parsed.append(path)
+                input_files_parsed.append(path)
     else:
         raise ValueError("Input file list must be a string, tuple of strings, or list of strings.")
 
@@ -194,13 +201,13 @@ def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output",
     fraction = float(fraction)  # make sure fraction is a float (not a string)
 
     if group_size > 1:
-        input_file_list_parsed = group_items(input_file_list_parsed, group_size=group_size)
+        input_files_parsed = group_items(input_files_parsed, group_size=group_size)
     
     # Count reads in each file and store in a dictionary
-    make_fastq_to_length_dict(input_file_list_parsed, verbose=verbose)
+    make_fastq_to_length_dict(input_files_parsed, verbose=verbose)
 
     # Do the sampling
-    sample_multiple_files(file_list=input_file_list_parsed, fraction=fraction, seed_list=seed, output=output_dir, gzip_output=gzip_output, replacement=replacement, verbose=verbose)
+    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seed, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, verbose=verbose)
 
 def main():
     # Create argument parser
@@ -212,16 +219,17 @@ def main():
     parser.add_argument("-g", "--group_size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)")
     parser.add_argument("-r", "--replacement", action="store_true", help="Sample with replacement. Default: False (without replacement).")
     parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files. Default: False")
+    parser.add_argument("-l", "--low_memory", action="store_true", help="Whether to use low memory mode (uses ~5.5x less memory than default, but adds marginal time to the data structure generation preprocessing). Default: False")
     parser.add_argument("-q", "--quiet", action="store_false", help="Turn off verbose output. Default: False")
     parser.add_argument("-v", "--version", action="version", version=f"fastQpick {__version__}", help="Show program's version number and exit")
 
     # Positional argument for input files (indefinite number)
-    parser.add_argument("input_file_list", nargs="+", help="Input FASTQ file(s) (one after the other, space-separated) or FASTQ folder(s)")
+    parser.add_argument("input_files", nargs="+", help="Input FASTQ file(s) (one after the other, space-separated) or FASTQ folder(s)")
 
     # Parse arguments
     args = parser.parse_args()
             
-    fastQpick(input_file_list=args.input_file_list,
+    fastQpick(input_files=args.input_files,
               fraction=args.fraction,
               seed=args.seed,
               output_dir=args.output_dir,
@@ -229,4 +237,5 @@ def main():
               group_size=args.group_size,
               replacement=args.replacement,
               overwrite=args.overwrite,
+              low_memory=args.low_memory,
               verbose=args.quiet)
