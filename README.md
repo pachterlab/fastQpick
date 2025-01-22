@@ -91,14 +91,14 @@ fastQpick(
 
 ## Examples
 
-1. Sample 10% of reads with replacement from a FASTQ file:
+### 1. Sample 10% of reads with replacement from a FASTQ file:
 
-### Command-line Example
+**Command-line**
 ```bash
 fastQpick --fraction 0.1 -r input.fastq
 ```
 
-### Python Example
+**Python**
 ```python
 from fastQpick import fastQpick
 
@@ -109,14 +109,14 @@ fastQpick(
 )
 ```
 
-2. Sample 100% of reads with replacement from multiple paired FASTQ files (R1, R2) across three seeds (i.e., bootstrapping):
+### 2. Sample 100% of reads with replacement from multiple paired FASTQ files (R1, R2) across three seeds (i.e., bootstrapping):
 
-### Command-line Example
+**Command-line**
 ```bash
 fastQpick --fraction 1 -s 42,43,44 -r -g 2 input1_R1.fastq input1_R2.fastq
 ```
 
-### Python Example
+**Python**
 ```python
 from fastQpick import fastQpick
 
