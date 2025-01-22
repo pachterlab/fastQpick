@@ -151,3 +151,4 @@ logs/
 # Scratch directories
 trash/
 **/test_files/**
+**/test_files_output/**

@@ -3,9 +3,11 @@ import inspect
 import json
 import os
 from collections import OrderedDict
+import pyfastx
 
 def count_reads(filepath):
-    num_reads = sum(1 for _ in read_fastq(filepath))
+    fastq_file = pyfastx.Fastx(filepath)
+    num_reads = sum(1 for _ in fastq_file)
     return num_reads
 
 def read_fastq(fastq_file, include_plus_line=False):
@@ -17,7 +19,7 @@ def read_fastq(fastq_file, include_plus_line=False):
         if include_plus_line:
             with open_func(fastq_file, open_mode) as file:
                 while True:
-                    header = file.readline().strip()[1:]
+                    header = file.readline().strip()
                     sequence = file.readline().strip()
                     plus_line = file.readline().strip()
                     quality = file.readline().strip()
@@ -29,7 +31,7 @@ def read_fastq(fastq_file, include_plus_line=False):
         else:  # copy-paste the code so that it doesn't have to check the conditional every iteration
             with open_func(fastq_file, open_mode) as file:
                 while True:
-                    header = file.readline().strip()[1:]
+                    header = file.readline().strip()
                     sequence = file.readline().strip()
                     plus_line = file.readline().strip()
                     quality = file.readline().strip()

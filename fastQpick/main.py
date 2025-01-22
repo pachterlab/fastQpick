@@ -4,22 +4,58 @@ import gzip
 import os
 import random
 from tqdm import tqdm
+import pyfastx  # to loop through fastq (faster than custom python code)
+from pysam import BGZFile  # to write to BGZF gzip files
 
-from fastQpick.utils import read_fastq, save_params_to_config_file, is_directory_effectively_empty, pair_items, count_reads
+from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, pair_items, count_reads
 
 # Global variables
 valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 use_buffer = True
 batch_size = 100000
+use_bgzf = True  # False to use regular gzip
 fastq_to_length_dict = {}  # set to empty, and the user can provide otherwise it will be calculated
 
-def write_fastq(input_fastq, output_path, occurrence_list, total_reads, open_func, write_mode, seed = None, verbose = True):
+def write_bgzf_without_buffer(f, name, seq, qual, occurrences):
+    """Writes to a BGZF file."""
+    # Join and encode the multiplied string
+    f.write((f"@{name}\n{seq}\n+\n{qual}\n" * occurrences).encode("utf-8"))
+
+def write_plain_without_buffer(f, name, seq, qual, occurrences):
+    """Writes to a plain text file."""
+    # Write directly using writelines
+    f.writelines(f"@{name}\n{seq}\n+\n{qual}\n" * occurrences)
+
+def write_bgzf(f, buffer):
+    """Writes the buffer to a BGZF file."""
+    f.write("".join(buffer).encode("utf-8"))
+
+def write_plain(f, buffer):
+    """Writes the buffer to a plain text file."""
+    f.writelines(buffer)
+
+def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, verbose = True):
+    if gzip_output:
+        global use_bgzf
+        open_func = BGZFile if use_bgzf else gzip.open
+        write_mode = "wb" if use_bgzf else "wt"
+        if use_buffer:
+            write_func = write_bgzf if use_bgzf else write_plain
+        else:
+            write_func = write_bgzf_without_buffer if use_bgzf else write_plain_without_buffer
+    else:
+        open_func = open
+        write_mode = "w"
+        write_func = write_plain if use_buffer else write_plain_without_buffer
+    
     buffer = []  # Temporary storage for the batch
+
+    input_fastq_read_only = pyfastx.Fastx(input_fastq)
 
     # use tqdm if verbose else silently loop
     iterator = (
-        tqdm(read_fastq(input_fastq), desc=f"Iterating through seed {seed}, file {input_fastq}", unit="read", total=total_reads)
-        if verbose else read_fastq(input_fastq)
+        tqdm(input_fastq_read_only, desc=f"Iterating through seed {seed}, file {input_fastq}", unit="read", total=total_reads)
+        if verbose else input_fastq_read_only
     )
 
     if use_buffer:
@@ -30,7 +66,7 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, open_fun
                 
                 # If the buffer reaches the batch size, write all at once and clear the buffer
                 if (i + 1) % batch_size == 0:
-                    f.writelines(buffer)
+                    write_func(f, buffer)
                     buffer.clear()  # Clear the buffer after writing
             
             # Write any remaining entries in the buffer
@@ -40,9 +76,7 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, open_fun
     else:
         with open_func(output_path, write_mode) as f:
             for i, (name, seq, qual) in enumerate(iterator):
-                f.writelines(
-                    f"@{name}\n{seq}\n+\n{qual}\n" * occurrence_list[i]
-                )
+                write_func(f, name, seq, qual, occurrence_list[i])
 
 def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, verbose):
     if replacement:
@@ -68,13 +102,6 @@ def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, rep
     return occurrence_list
 
 def bootstrap_single_file(file = None, file1 = None, file2 = None, gzip_output = None, output_path = None, output_path1 = None, output_path2 = None, seed = None, fraction = None, replacement = None, verbose=True):
-    if gzip_output:
-        open_func = gzip.open
-        write_mode = "wt"
-    else:
-        open_func = open
-        write_mode = "w"
-
     # Create output directory if it doesn't exist
     output_path_args = [output_path, output_path1, output_path2]
     for output_path_arg in output_path_args:
@@ -95,7 +122,7 @@ def bootstrap_single_file(file = None, file1 = None, file2 = None, gzip_output =
         occurrence_list = make_occurrence_list(file=file, seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, verbose=verbose)
 
         # write fastq
-        write_fastq(input_fastq = file, output_path = output_path, occurrence_list = occurrence_list, total_reads = total_reads, open_func = open_func, write_mode = write_mode, seed = seed, verbose = verbose)
+        write_fastq(input_fastq = file, output_path = output_path, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, verbose = verbose)
 
     elif file1 and file2:
         if not output_path1:
@@ -117,8 +144,8 @@ def bootstrap_single_file(file = None, file1 = None, file2 = None, gzip_output =
 
         # TODO: multithread this
         # write fastqs
-        write_fastq(input_fastq = file1, output_path = output_path1, occurrence_list = occurrence_list, total_reads = total_reads, open_func = open_func, write_mode = write_mode, seed = seed, verbose = verbose)
-        write_fastq(input_fastq = file2, output_path = output_path2, occurrence_list = occurrence_list, total_reads = total_reads, open_func = open_func, write_mode = write_mode, seed = seed, verbose = verbose)
+        write_fastq(input_fastq = file1, output_path = output_path1, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, verbose = verbose)
+        write_fastq(input_fastq = file2, output_path = output_path2, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, verbose = verbose)
 
     else:
         raise ValueError("You must provide either a single FASTQ file or paired-end FASTQ files.")
@@ -198,6 +225,7 @@ def fastQpick(input_file_list, fraction, seed=42, output_dir="fastQpick_output",
     kwargs
     ------
     fastq_to_length_dict (dict) Dictionary of FASTQ file paths to number of reads in each file. If not provided, will be calculated.
+    use_bgzf (bool)             Use BGZF compression for gzip output. Default: True
     """
     # check if fastq_to_length_dict is in kwargs
     if "fastq_to_length_dict" in kwargs and isinstance(kwargs["fastq_to_length_dict"], dict):

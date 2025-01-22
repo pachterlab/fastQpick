@@ -74,10 +74,6 @@ IIIIIIIIIIIIIIIIIIIII
 CCCCCCCCAAAAAAAAAAAAA
 +
 IIIIIIIIIIIIIIIIIIIII
-@Header5_2
-CCCCCCGGGGGGGGGGGGGGG
-+
-IIIIIIIIIIIIIIIIIIIII
 """
 
     # Create two temporary files
@@ -87,7 +83,7 @@ IIIIIIIIIIIIIIIIIIIII
         temp_file2.write(content_2)
         temp_file1.seek(0)
         temp_file2.seek(0)
-        yield temp_file1.name, temp_file2.name  # Yield the paths of both files
+        yield [temp_file1.name, temp_file2.name]  # Yield the paths of both files
 
     # Cleanup after the test
     os.remove(temp_file1.name)
@@ -113,11 +109,11 @@ def validate_fastq_format(file_path, ground_truth=None):
             assert plus_line == ground_truth[header]["plus_line"], f"Plus line mismatch - expected: {plus_line}; got: {ground_truth[header]['plus_line']}"
             assert qual == ground_truth[header]["quality"], f"Quality mismatch - expected: {qual}; got: {ground_truth[header]['quality']}"
 
-def check_for_read_uniqueness(file_path):
+def count_number_of_unique_headers(file_path):
     headers = set()
     for header, _, _, _ in read_fastq(file_path, include_plus_line=True):
-        assert header not in headers, f"Non-unique header found: {header}"
         headers.add(header)
+    return len(headers)
 
 def make_fastq_dict(file_path):
     fastq_dict = {}
@@ -127,6 +123,53 @@ def make_fastq_dict(file_path):
         fastq_dict[header]["plus_line"] = plus_line
         fastq_dict[header]["quality"] = qual
     return fastq_dict
+
+def check_pairwise_agreement(file1, file2):
+    for (header1, seq1, plus_line1, qual1), (header2, seq2, plus_line2, qual2) in zip(
+        read_fastq(file1, include_plus_line=True), 
+        read_fastq(file2, include_plus_line=True)
+    ):
+        # Split headers up to the last underscore
+        split_header1 = header1.rsplit('_', 1)[0]
+        split_header2 = header2.rsplit('_', 1)[0]
+
+        # Assert that the two headers are equal
+        assert split_header1 == split_header2, f"Headers do not match: {split_header1} != {split_header2}"
+
+def run_all_single_file_tests(temp_output_dir, temp_fastq_file, gzip_output, fraction, replacement):
+    # Assert that the output directory exists
+        assert os.path.exists(temp_output_dir), "Output directory does not exist!"
+
+        # Optionally, verify the output files
+        output_files = os.listdir(temp_output_dir)
+        assert len(output_files) > 0, "No output files were created!"
+
+        file_base_name = os.path.basename(temp_fastq_file)
+        output_fastq_file = os.path.join(temp_output_dir, file_base_name)
+
+        if gzip_output:
+            output_fastq_file += ".gz"
+
+        input_fastq_dict = make_fastq_dict(temp_fastq_file)
+        validate_fastq_format(output_fastq_file, ground_truth=input_fastq_dict)
+
+        output_is_gzipped = is_gzipped(output_fastq_file)
+        assert output_is_gzipped == gzip_output, f"Gzipped output - expected: {gzip_output}; got: {output_is_gzipped}"
+
+        num_reads_truth = count_reads(temp_fastq_file)
+        num_reads_output = count_reads(output_fastq_file)
+
+        assert num_reads_output == num_reads_truth * fraction, f"Number of reads mismatch - expected: {num_reads_truth * fraction}; got: {num_reads_output}"
+
+        num_unique_reads = count_number_of_unique_headers(output_fastq_file)
+
+        if not replacement:
+            assert num_unique_reads == num_reads_output, f"Number of unique reads mismatch - expected: {num_reads_output}; got: {num_unique_reads}"
+
+        if replacement and fraction > 1:
+            assert num_unique_reads < num_reads_output, f"Number of unique reads mismatch - expected: less than {num_reads_output}; got: {num_unique_reads}"
+
+        # st()
 
 def test_single_file(temp_fastq_file):
     fraction = 0.6
@@ -147,35 +190,128 @@ def test_single_file(temp_fastq_file):
                 overwrite=True
                 )
         
-        # Assert that the output directory exists
-        assert os.path.exists(temp_output_dir), "Output directory does not exist!"
+        run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-        # Optionally, verify the output files
-        output_files = os.listdir(temp_output_dir)
-        assert len(output_files) > 0, "No output files were created!"
+def test_single_file_bootstrapped(temp_fastq_file):
+    fraction = 1
+    seed = 42
+    gzip_output = False
+    paired = False
+    replacement = True
+    
+    with tempfile.TemporaryDirectory() as temp_output_dir:
+        fastQpick(input_file_list=temp_fastq_file,
+                fraction=fraction,
+                seed=seed,
+                output_dir=temp_output_dir,
+                threads=1,
+                gzip_output=gzip_output,
+                paired=paired,
+                replacement=replacement,
+                overwrite=True
+                )
+        
+        run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-        file_base_name = os.path.basename(temp_fastq_file)
-        output_fastq_file = os.path.join(temp_output_dir, file_base_name)
-
-        input_fastq_dict = make_fastq_dict(temp_fastq_file)
-        validate_fastq_format(output_fastq_file, ground_truth=input_fastq_dict)
-
-        output_is_gzipped = is_gzipped(output_fastq_file)
-        assert output_is_gzipped == gzip_output, f"Gzipped output - expected: {gzip_output}; got: {output_is_gzipped}"
-
-        num_reads_truth = count_reads(temp_fastq_file)
-        num_reads_output = count_reads(output_fastq_file)
-
-        assert num_reads_output == num_reads_truth * fraction, f"Number of reads mismatch - expected: {num_reads_truth * fraction}; got: {num_reads_output}"
-
-        if not replacement:
-            check_for_read_uniqueness(output_fastq_file)
-
+def test_single_file_oversampled(temp_fastq_file):
+    fraction = 3
+    seed = 42
+    gzip_output = False
+    paired = False
+    replacement = True
+    
+    with tempfile.TemporaryDirectory() as temp_output_dir:
+        fastQpick(input_file_list=temp_fastq_file,
+                fraction=fraction,
+                seed=seed,
+                output_dir=temp_output_dir,
+                threads=1,
+                gzip_output=gzip_output,
+                paired=paired,
+                replacement=replacement,
+                overwrite=True
+                )
+        
+        run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
+        
+def test_single_gzipped(temp_fastq_file):
+    fraction = 0.6
+    seed = 42
+    gzip_output = True
+    paired = False
+    replacement = False
+    
+    with tempfile.TemporaryDirectory() as temp_output_dir:
+        fastQpick(input_file_list=temp_fastq_file,
+                fraction=fraction,
+                seed=seed,
+                output_dir=temp_output_dir,
+                threads=1,
+                gzip_output=gzip_output,
+                paired=paired,
+                replacement=replacement,
+                overwrite=True
+                )
+        
         st()
         
+        run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-# Example test using the paired FASTQ files
+
 def test_paired_files(temp_paired_fastq_files):
-    pass
+    fraction = 0.75
+    seed = 42
+    gzip_output = False
+    paired = False
+    replacement = False
+    
+    with tempfile.TemporaryDirectory() as temp_output_dir:
+        fastQpick(input_file_list=temp_paired_fastq_files,
+                fraction=fraction,
+                seed=seed,
+                output_dir=temp_output_dir,
+                threads=1,
+                gzip_output=gzip_output,
+                paired=paired,
+                replacement=replacement,
+                overwrite=True
+                )
+        
+        for fastq_file in temp_paired_fastq_files:
+            run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
+        check_pairwise_agreement(temp_paired_fastq_files[0], temp_paired_fastq_files[1])
 
+def test_paired_files_bootstrapped(temp_paired_fastq_files):
+    fraction = 1
+    seed = 42
+    gzip_output = False
+    paired = False
+    replacement = True
+    
+    with tempfile.TemporaryDirectory() as temp_output_dir:
+        fastQpick(input_file_list=temp_paired_fastq_files,
+                fraction=fraction,
+                seed=seed,
+                output_dir=temp_output_dir,
+                threads=1,
+                gzip_output=gzip_output,
+                paired=paired,
+                replacement=replacement,
+                overwrite=True
+                )
+        
+        for fastq_file in temp_paired_fastq_files:
+            run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
+
+        file1_base_name = os.path.basename(temp_paired_fastq_files[0])
+        file2_base_name = os.path.basename(temp_paired_fastq_files[1])
+        
+        output_fastq_file1 = os.path.join(temp_output_dir, file1_base_name)
+        output_fastq_file2 = os.path.join(temp_output_dir, file2_base_name)
+
+        if gzip_output:
+            output_fastq_file1 += ".gz"
+            output_fastq_file2 += ".gz"
+        
+        check_pairwise_agreement(output_fastq_file1, output_fastq_file2)
