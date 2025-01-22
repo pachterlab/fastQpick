@@ -65,16 +65,16 @@ fastQpick(
   ```
 
 ### Options
-input_files (str, list, or tuple)       List of input FASTQ files or directories containing FASTQ files. Required. Positional argument on command line.
-fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.
-seed (int or str)                       Random seed(s). Can provide multiple seeds separated by commas. Default: 42
-output_dir (str)                        Output directory. Default: ./fastQpick_output
-gzip_output (bool)                      Whether or not to gzip the output. Default: False (uncompressed)
-group_size (int)                        The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)
-replacement (bool)                      Sample with replacement. Default: False (without replacement).
-overwrite (bool)                        Overwrite existing output files. Default: False
-low_memory (bool)                       Whether to use low memory mode (uses ~5.5x less memory than default, but adds marginal time to the data structure generation preprocessing). Default: False
-verbose (bool)                          Whether to print progress information. Default: True
+- input_files (str, list, or tuple)        List of input FASTQ files or directories containing FASTQ files. Required. Positional argument on command line.
+-  fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.
+-  seed (int or str)                       Random seed(s). Can provide multiple seeds separated by commas. Default: 42
+-  output_dir (str)                        Output directory. Default: ./fastQpick_output
+-  gzip_output (bool)                      Whether or not to gzip the output. Default: False (uncompressed)
+-  group_size (int)                        The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 -  would have group_size=3. Default: 1 (unpaired)
+-  replacement (bool)                      Sample with replacement. Default: False (without replacement).
+-  overwrite (bool)                        Overwrite existing output files. Default: False
+-  low_memory (bool)                       Whether to use low memory mode (uses ~5.5x less memory than default, but adds marginal time to the data -  structure generation preprocessing). Default: False
+-  verbose (bool)                          Whether to print progress information. Default: True
 
 ---
 
