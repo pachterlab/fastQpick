@@ -132,7 +132,7 @@ fastQpick(
 
 ## License
 
-fastQpick is licensed under the 2-clause BSD-2 license. See the [LICENSE](LICENSE) file for details.
+fastQpick is licensed under the 2-clause BSD license. See the [LICENSE](LICENSE) file for details.
 
 ---
 
