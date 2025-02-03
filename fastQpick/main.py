@@ -3,6 +3,7 @@ import gzip
 import os
 import random
 from tqdm import tqdm
+from collections import Counter
 import pyfastx  # to loop through fastq (faster than custom python code)
 
 from fastQpick._version import __version__
@@ -13,7 +14,8 @@ valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 batch_size = 200000  # for buffer
 fastq_to_length_dict = {}  # set to empty, and the user can provide otherwise it will be calculated
 
-def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, verbose = True):
+# TODO: have a flag unique_header_names that will add a unique identifier to the header names of the output files (likely just {name}_{i})
+def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, unique_headers = False, verbose = True):
     if gzip_output:
         open_func = gzip.open
         write_mode = "wt"
@@ -31,20 +33,31 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
         if verbose else input_fastq_read_only
     )
 
+    
     with open_func(output_path, write_mode) as f:
-        for i, (name, seq, qual) in enumerate(iterator):
-            # Add the FASTQ entry to the buffer
-            buffer.extend([f"@{name}\n{seq}\n+\n{qual}\n"] * occurrence_list[i])
+        if not unique_headers:  # original (non-unique) headers
+            for i, (name, seq, qual) in enumerate(iterator):
+                # Add the FASTQ entry to the buffer
+                buffer.extend([f"@{name}\n{seq}\n+\n{qual}\n"] * occurrence_list[i])
+                
+                # If the buffer reaches the batch size, write all at once and clear the buffer
+                if (i + 1) % batch_size == 0:
+                    f.writelines(buffer)
+                    buffer.clear()  # Clear the buffer after writing
+        else:  # unique headers
+            for i, (name, seq, qual) in enumerate(iterator):
+                if occurrence_list[i] > 0:  # not strictly necessary for coding logic, but saves time (if 0 > 0 is faster than saying for j in range(0))
+                    buffer.extend([f"@{name}_{j}\n{seq}\n+\n{qual}\n" for j in range(1, occurrence_list[i]+1)])
+                    
+                # If the buffer reaches the batch size, write all at once and clear the buffer
+                if (i + 1) % batch_size == 0:
+                    f.writelines(buffer)
+                    buffer.clear()
             
-            # If the buffer reaches the batch size, write all at once and clear the buffer
-            if (i + 1) % batch_size == 0:
+            # Write any remaining entries in the buffer
+            if buffer:
                 f.writelines(buffer)
-                buffer.clear()  # Clear the buffer after writing
-        
-        # Write any remaining entries in the buffer
-        if buffer:
-            f.writelines(buffer)
-            buffer.clear()
+                buffer.clear()
 
 def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, low_memory, verbose):
     if verbose:
@@ -60,24 +73,27 @@ def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, rep
         else:
             random_indices = tuple(random.sample(range(total_reads), k=number_of_reads_to_sample))  # without replacement
 
-    # Initialize a list with zeros
-    occurrence_list = [0] * total_reads
+    # Count occurrences
+    if number_of_reads_to_sample < (total_reads / 10):  # a heuristic for when the memory savings of a counter will exceed a list (dictionary-like overhead of counter makes it exceed memory of list otherwise)
+        occurrence_list = Counter(random_indices)
+    else:
+        # Initialize a list with zeros
+        occurrence_list = [0] * total_reads
 
-    # use tqdm if verbose, else just silently loop through
-    iterator = (
-        tqdm(random_indices, desc=f"Counting occurrences for seed {seed}, file {file}", unit="read", total=number_of_reads_to_sample)
-        if verbose else random_indices
-    )
-
-    # Count occurrences (I don't use a counter in order to save memory, as a counter is essentially a dictionary)
-    for index in iterator:
-        occurrence_list[index] += 1
+        # use tqdm if verbose, else just silently loop through
+        iterator = (
+            tqdm(random_indices, desc=f"Counting occurrences for seed {seed}, file {file}", unit="read", total=number_of_reads_to_sample)
+            if verbose else random_indices
+        )
+    
+        for index in iterator:
+            occurrence_list[index] += 1
 
     del random_indices
 
     return occurrence_list
 
-def bootstrap_single_file(files_total = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, low_memory = False, verbose=True):
+def bootstrap_single_file(files_total = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, low_memory = False, unique_headers = False, verbose=True):
     if isinstance(files_total, str):
         files_total = (files_total, )
 
@@ -98,13 +114,13 @@ def bootstrap_single_file(files_total = None, gzip_output = None, output_directo
             output_path = output_path[:-3]
 
         # write fastq
-        write_fastq(input_fastq = file, output_path = output_path, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, verbose = verbose)
+        write_fastq(input_fastq = file, output_path = output_path, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, verbose = verbose)
 
-def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, verbose):
+def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, unique_headers, verbose):
     for seed in seed_list:
         random.seed(seed)
         for file in file_list:
-            bootstrap_single_file(files_total = file, gzip_output = gzip_output, output_directory = output, seed = seed, fraction = fraction, replacement = replacement, low_memory = low_memory, verbose = verbose)
+            bootstrap_single_file(files_total = file, gzip_output = gzip_output, output_directory = output, seed = seed, fraction = fraction, replacement = replacement, low_memory = low_memory, unique_headers = unique_headers, verbose = verbose)
     
 def make_fastq_to_length_dict(file_list, verbose=True):
     global fastq_to_length_dict
@@ -127,7 +143,7 @@ def make_fastq_to_length_dict(file_list, verbose=True):
     if verbose:
         print("fastq_to_length_dict:", fastq_to_length_dict)
 
-def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzip_output=False, group_size=1, replacement=False, overwrite=False, low_memory=False, verbose=True, **kwargs):
+def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzip_output=False, group_size=1, replacement=False, overwrite=False, low_memory=False, unique_headers=False, verbose=True, **kwargs):
     """
     Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement.
 
@@ -142,6 +158,7 @@ def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzi
     replacement (bool)                      Sample with replacement. Default: False (without replacement).
     overwrite (bool)                        Overwrite existing output files. Default: False
     low_memory (bool)                       Whether to use low memory mode (uses ~5.5x less memory than default, but adds marginal time to the data structure generation preprocessing). Default: False
+    unique_headers (bool)                   Whether to add a unique identifier to the header names of the output files. Default: False
     verbose (bool)                          Whether to print progress information. Default: True
 
     kwargs
@@ -207,7 +224,7 @@ def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzi
     make_fastq_to_length_dict(input_files_parsed, verbose=verbose)
 
     # Do the sampling
-    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seed, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, verbose=verbose)
+    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seed, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, unique_headers=unique_headers, verbose=verbose)
 
 def main():
     # Create argument parser
@@ -220,6 +237,7 @@ def main():
     parser.add_argument("-r", "--replacement", action="store_true", help="Sample with replacement. Default: False (without replacement).")
     parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files. Default: False")
     parser.add_argument("-l", "--low_memory", action="store_true", help="Whether to use low memory mode (uses ~5.5x less memory than default, but adds marginal time to the data structure generation preprocessing). Default: False")
+    parser.add_argument("-u", "--unique_headers", action="store_true", help="Whether to add a unique identifier to the header names of the output files. Default: False")
     parser.add_argument("-q", "--quiet", action="store_false", help="Turn off verbose output. Default: False")
     parser.add_argument("-v", "--version", action="version", version=f"fastQpick {__version__}", help="Show program's version number and exit")
 
@@ -238,4 +256,5 @@ def main():
               replacement=args.replacement,
               overwrite=args.overwrite,
               low_memory=args.low_memory,
+              unique_headers=args.unique_headers,
               verbose=args.quiet)
