@@ -200,8 +200,6 @@ def test_single_file(temp_fastq_file):
         
         run_all_single_file_tests(temp_output_dir=temp_output_dir, temp_fastq_file=temp_fastq_file, gzip_output=gzip_output, fraction=fraction, replacement=replacement)
 
-        # st()
-
 def test_single_file_bootstrapped(temp_fastq_file):
     fraction = 1
     seed = 42

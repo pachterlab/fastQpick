@@ -2,6 +2,7 @@ import argparse
 import gzip
 import os
 import random
+import numpy as np
 from tqdm import tqdm
 from collections import Counter
 import pyfastx  # to loop through fastq (faster than custom python code)
@@ -14,7 +15,6 @@ valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 batch_size = 200000  # for buffer
 fastq_to_length_dict = {}  # set to empty, and the user can provide otherwise it will be calculated
 
-# TODO: have a flag unique_header_names that will add a unique identifier to the header names of the output files (likely just {name}_{i})
 def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, unique_headers = False, verbose = True):
     if gzip_output:
         open_func = gzip.open
@@ -32,7 +32,6 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
         tqdm(input_fastq_read_only, desc=f"Iterating through seed {seed}, file {input_fastq}", unit="read", total=total_reads)
         if verbose else input_fastq_read_only
     )
-
     
     with open_func(output_path, write_mode) as f:
         if not unique_headers:  # original (non-unique) headers
@@ -54,40 +53,27 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
                     f.writelines(buffer)
                     buffer.clear()
             
-            # Write any remaining entries in the buffer
-            if buffer:
-                f.writelines(buffer)
-                buffer.clear()
+        # Write any remaining entries in the buffer
+        if buffer:
+            f.writelines(buffer)
+            buffer.clear()
 
 def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, low_memory, verbose):
     if verbose:
         print(f"Calculating total reads and determining random indices for seed {seed}, file {file}")
-    if replacement:
-        if low_memory:
+    if low_memory:
+        if replacement:
             random_indices = (random.choice(range(total_reads)) for _ in range(number_of_reads_to_sample))
         else:
-            random_indices = tuple(random.choices(range(total_reads), k=number_of_reads_to_sample))  # with replacement
-    else:
-        if low_memory:
             random_indices = (index for index in random.sample(range(total_reads), k=number_of_reads_to_sample))
-        else:
-            random_indices = tuple(random.sample(range(total_reads), k=number_of_reads_to_sample))  # without replacement
+    else:
+        random_indices = np.random.choice(total_reads, size=number_of_reads_to_sample, replace=replacement)
 
     # Count occurrences
     if number_of_reads_to_sample < (total_reads / 10):  # a heuristic for when the memory savings of a counter will exceed a list (dictionary-like overhead of counter makes it exceed memory of list otherwise)
         occurrence_list = Counter(random_indices)
     else:
-        # Initialize a list with zeros
-        occurrence_list = [0] * total_reads
-
-        # use tqdm if verbose, else just silently loop through
-        iterator = (
-            tqdm(random_indices, desc=f"Counting occurrences for seed {seed}, file {file}", unit="read", total=number_of_reads_to_sample)
-            if verbose else random_indices
-        )
-    
-        for index in iterator:
-            occurrence_list[index] += 1
+        occurrence_list = np.bincount(random_indices, minlength=total_reads)
 
     del random_indices
 
