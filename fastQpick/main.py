@@ -61,19 +61,22 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
 def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, low_memory, verbose):
     if verbose:
         print(f"Calculating total reads and determining random indices for seed {seed}, file {file}")
+
     if low_memory:
         if replacement:
             random_indices = (random.choice(range(total_reads)) for _ in range(number_of_reads_to_sample))
         else:
             random_indices = (index for index in random.sample(range(total_reads), k=number_of_reads_to_sample))
     else:
-        random_indices = np.random.choice(total_reads, size=number_of_reads_to_sample, replace=replacement)
+        dtype_random_indices = np.uint32 if total_reads <= np.iinfo(np.uint32).max else np.uint64  # ensures the minimum data type - based on total_reads (random_indices has number_of_reads_to_sample elements each between 0 and total_reads)
+        random_indices = np.random.choice(np.arange(total_reads, dtype=dtype_random_indices), size=number_of_reads_to_sample, replace=replacement)
 
     # Count occurrences
     if number_of_reads_to_sample < (total_reads / 10):  # a heuristic for when the memory savings of a counter will exceed a list (dictionary-like overhead of counter makes it exceed memory of list otherwise)
         occurrence_list = Counter(random_indices)
     else:
-        occurrence_list = np.bincount(random_indices, minlength=total_reads)
+        dtype_occurences_list = np.uint32 if number_of_reads_to_sample <= np.iinfo(np.uint32).max else np.uint64  # ensures the minimum data type - based on number_of_reads_to_sample (random_indices has total_reads elements each between 0 and number_of_reads_to_sample)
+        occurrence_list = np.bincount(random_indices, minlength=total_reads).astype(dtype_occurences_list)
 
     del random_indices
 
