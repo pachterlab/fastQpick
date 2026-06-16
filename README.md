@@ -66,12 +66,12 @@ fastQpick(
 
 ### Options
 - input_files (str, list, or tuple)        List of input FASTQ files or directories containing FASTQ files. Required. Positional argument on command line.
--  fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.
--  seed (int or str)                       Random seed(s). Can provide multiple seeds separated by commas. Default: 42
+-  fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 forces sampling with replacement.
+-  seeds (int, str, or list)               Random seed(s). Provide a single int (e.g. 42), an inclusive dash-delimited range string (e.g. "1-300" for seeds 1 through 300), or a list mixing ints and range strings (e.g. [1, 2, "5-7"]). On the command line, pass space-separated values (e.g. -s 1 2 5-7). Default: 42
 -  output_dir (str)                        Output directory. Default: ./fastQpick_output
 -  gzip_output (bool)                      Whether or not to gzip the output. Default: False (uncompressed)
 -  group_size (int)                        The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 -  would have group_size=3. Default: 1 (unpaired)
--  replacement (bool)                      Sample with replacement. Default: False (without replacement).
+-  disable_replacement (bool)              Sample without replacement. By default (flag omitted), sampling is done with replacement.
 -  overwrite (bool)                        Overwrite existing output files. Default: False
 -  low_memory (bool)                       Whether to use low memory mode (uses ~5.5x less memory than default, but adds marginal time to the data -  structure generation preprocessing). Default: False
 -  verbose (bool)                          Whether to print progress information. Default: True
@@ -100,7 +100,7 @@ Low memory mode vs. standard, when fraction=1 (i.e., number of reads to sample i
 
 **Command-line**
 ```bash
-fastQpick --fraction 0.1 -r input.fastq
+fastQpick --fraction 0.1 input.fastq
 ```
 
 **Python**
@@ -109,16 +109,17 @@ from fastQpick import fastQpick
 
 fastQpick(
     input_files='input.fastq',
-    fraction=0.1,
-    replacement=True
+    fraction=0.1
 )
 ```
+
+Sampling is done with replacement by default. Pass `--disable_replacement` (CLI) or `replacement=False` (Python) to sample without replacement.
 
 ### 2. Sample 100% of reads with replacement from multiple paired FASTQ files (R1, R2) across three seeds (i.e., bootstrapping):
 
 **Command-line**
 ```bash
-fastQpick --fraction 1 -s 42,43,44 -r -g 2 input1_R1.fastq input1_R2.fastq
+fastQpick --fraction 1 -s 42 43 44 -g 2 input1_R1.fastq input1_R2.fastq
 ```
 
 **Python**
@@ -128,11 +129,14 @@ from fastQpick import fastQpick
 fastQpick(
     input_files='input.fastq',
     fraction=1,
-    seed="42,43,44",
+    seeds=[42, 43, 44],
     replacement=True,
     group_size=2,
 )
 ```
+
+Seeds can also be given as inclusive dash-delimited ranges, which is convenient for many bootstrap replicates. For example, `-s 1-300` (or `seeds="1-300"`) runs seeds 1 through 300, and values can be mixed: `-s 1 5 10-12` (or `seeds=[1, 5, "10-12"]`) runs seeds 1, 5, 10, 11, and 12.
+
 ---
 
 ## License

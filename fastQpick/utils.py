@@ -10,6 +10,55 @@ def count_reads(filepath):
     num_reads = sum(1 for _ in fastq_file)
     return num_reads
 
+def _parse_seed_token(token):
+    """Expand a single seed token into a list of integers.
+
+    A token is either an integer (e.g. 42 or "42") or an inclusive
+    dash-delimited range string (e.g. "1-300" expands to 1, 2, ..., 300).
+    """
+    if isinstance(token, int):
+        return [token]
+    if not isinstance(token, str):
+        raise ValueError(f"Each seed must be an int or a string, got {type(token).__name__}.")
+
+    token = token.strip()
+    if "-" in token:
+        start_str, _, end_str = token.partition("-")
+        try:
+            start, end = int(start_str), int(end_str)
+        except ValueError:
+            raise ValueError(f"Invalid seed range '{token}'. Expected the form 'start-end' with integers.")
+        if end < start:
+            raise ValueError(f"Invalid seed range '{token}'. The end ({end}) must not be less than the start ({start}).")
+        return list(range(start, end + 1))
+    try:
+        return [int(token)]
+    except ValueError:
+        raise ValueError(f"Invalid seed '{token}'. Expected an integer or a dash-delimited range like '1-300'.")
+
+def parse_seed(seeds):
+    """Normalize a seed specification into a list of integer seeds.
+
+    Accepts an int, a single token string (a single integer like "42" or an
+    inclusive dash-delimited range like "1-300"), or any iterable (list, tuple,
+    range, ...) whose elements are any of these, expanded in order. For example,
+    [1, 2, "5-7"] expands to [1, 2, 5, 6, 7].
+    """
+    if isinstance(seeds, (str, int)):
+        items = [seeds]
+    else:
+        try:
+            items = list(seeds)
+        except TypeError:
+            raise ValueError(f"Seeds must be an int, a string, or an iterable of these, got {type(seeds).__name__}.")
+
+    seed_list = []
+    for token in items:
+        seed_list.extend(_parse_seed_token(token))
+    if not seed_list:
+        raise ValueError("No valid seeds were parsed from the seed specification.")
+    return seed_list
+
 def read_fastq(fastq_file, include_plus_line=False):
     is_gzipped = fastq_file.endswith(".gz")
     open_func = gzip.open if is_gzipped else open

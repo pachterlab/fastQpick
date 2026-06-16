@@ -152,3 +152,8 @@ logs/
 trash/
 **/test_files/**
 **/test_files_output/**
+CLAUDE.md
+main.*
+ref.bib
+.latexmkrc
+notebooks/figures

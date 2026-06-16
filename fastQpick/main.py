@@ -8,7 +8,7 @@ from collections import Counter
 import pyfastx  # to loop through fastq (faster than custom python code)
 
 from fastQpick._version import __version__
-from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, group_items, count_reads
+from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, group_items, count_reads, parse_seed
 
 # Global variables
 valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
@@ -62,27 +62,48 @@ def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, rep
     if verbose:
         print(f"Calculating total reads and determining random indices for seed {seed}, file {file}")
 
+    # a heuristic for when the memory savings of a counter will exceed a list (dictionary-like overhead of counter makes it exceed memory of list otherwise)
+    use_counter = number_of_reads_to_sample < (total_reads / 10)
+
     if low_memory:
         if replacement:
             random_indices = (random.choice(range(total_reads)) for _ in range(number_of_reads_to_sample))
         else:
             random_indices = (index for index in random.sample(range(total_reads), k=number_of_reads_to_sample))
+
+        # Count occurrences. random_indices is a lazy generator here, so it cannot be
+        # handed to np.bincount (which needs a materialized array); accumulate instead.
+        if use_counter:
+            occurrence_list = Counter(random_indices)
+        else:
+            dtype_occurences_list = np.uint32 if number_of_reads_to_sample <= np.iinfo(np.uint32).max else np.uint64
+            occurrence_list = np.zeros(total_reads, dtype=dtype_occurences_list)
+            for index in random_indices:
+                occurrence_list[index] += 1
     else:
         dtype_random_indices = np.uint32 if total_reads <= np.iinfo(np.uint32).max else np.uint64  # ensures the minimum data type - based on total_reads (random_indices has number_of_reads_to_sample elements each between 0 and total_reads)
         random_indices = np.random.choice(np.arange(total_reads, dtype=dtype_random_indices), size=number_of_reads_to_sample, replace=replacement)
 
-    # Count occurrences
-    if number_of_reads_to_sample < (total_reads / 10):  # a heuristic for when the memory savings of a counter will exceed a list (dictionary-like overhead of counter makes it exceed memory of list otherwise)
-        occurrence_list = Counter(random_indices)
-    else:
-        dtype_occurences_list = np.uint32 if number_of_reads_to_sample <= np.iinfo(np.uint32).max else np.uint64  # ensures the minimum data type - based on number_of_reads_to_sample (random_indices has total_reads elements each between 0 and number_of_reads_to_sample)
-        occurrence_list = np.bincount(random_indices, minlength=total_reads).astype(dtype_occurences_list)
+        # Count occurrences
+        if use_counter:
+            occurrence_list = Counter(random_indices)
+        else:
+            dtype_occurences_list = np.uint32 if number_of_reads_to_sample <= np.iinfo(np.uint32).max else np.uint64  # ensures the minimum data type - based on number_of_reads_to_sample (random_indices has total_reads elements each between 0 and number_of_reads_to_sample)
+            occurrence_list = np.bincount(random_indices, minlength=total_reads).astype(dtype_occurences_list)
 
     del random_indices
 
     return occurrence_list
 
-def bootstrap_single_file(files_total = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, low_memory = False, unique_headers = False, verbose=True):
+def insert_seed_suffix(filename, seed):
+    # Insert a per-seed marker before the FASTQ extension, e.g. "R1.fastq.gz" -> "R1.seed3.fastq.gz",
+    # so that distinct seeds write to distinct output files instead of overwriting one another.
+    for ext in sorted(valid_fastq_extensions, key=len, reverse=True):
+        if filename.endswith(ext):
+            return f"{filename[:-len(ext)]}.seed{seed}{ext}"
+    return f"{filename}.seed{seed}"
+
+def bootstrap_single_file(files_total = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, low_memory = False, unique_headers = False, multiple_seeds = False, verbose=True):
     if isinstance(files_total, str):
         files_total = (files_total, )
 
@@ -90,10 +111,13 @@ def bootstrap_single_file(files_total = None, gzip_output = None, output_directo
     number_of_reads_to_sample = int(fraction * total_reads)
 
     occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, low_memory=low_memory, verbose=verbose)
-    
+
     for file in files_total:
         # Create output directory if it doesn't exist
-        output_path = os.path.join(output_directory, os.path.basename(file))
+        output_basename = os.path.basename(file)
+        if multiple_seeds:  # disambiguate output files when more than one seed is sampled
+            output_basename = insert_seed_suffix(output_basename, seed)
+        output_path = os.path.join(output_directory, output_basename)
         if output_directory:
             os.makedirs(output_directory, exist_ok=True)
 
@@ -106,10 +130,11 @@ def bootstrap_single_file(files_total = None, gzip_output = None, output_directo
         write_fastq(input_fastq = file, output_path = output_path, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, verbose = verbose)
 
 def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, unique_headers, verbose):
+    multiple_seeds = len(seed_list) > 1
     for seed in seed_list:
         random.seed(seed)
         for file in file_list:
-            bootstrap_single_file(files_total = file, gzip_output = gzip_output, output_directory = output, seed = seed, fraction = fraction, replacement = replacement, low_memory = low_memory, unique_headers = unique_headers, verbose = verbose)
+            bootstrap_single_file(files_total = file, gzip_output = gzip_output, output_directory = output, seed = seed, fraction = fraction, replacement = replacement, low_memory = low_memory, unique_headers = unique_headers, multiple_seeds = multiple_seeds, verbose = verbose)
     
 def make_fastq_to_length_dict(file_list, verbose=True):
     global fastq_to_length_dict
@@ -132,7 +157,7 @@ def make_fastq_to_length_dict(file_list, verbose=True):
     if verbose:
         print("fastq_to_length_dict:", fastq_to_length_dict)
 
-def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzip_output=False, group_size=1, replacement=False, overwrite=False, low_memory=False, unique_headers=False, verbose=True, **kwargs):
+def fastQpick(input_files, fraction, seeds=42, output_dir="fastQpick_output", gzip_output=False, group_size=1, replacement=True, overwrite=False, low_memory=False, unique_headers=False, verbose=True, **kwargs):
     """
     Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement.
 
@@ -140,11 +165,11 @@ def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzi
     ----------
     input_files (str, list, or tuple)       List of input FASTQ files or directories containing FASTQ files.
     fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.
-    seed (int or str)                       Random seed(s). Can provide multiple seeds separated by commas. Default: 42
+    seeds (int, str, or list)               Random seed(s). Provide a single int (e.g. 42), an inclusive dash-delimited range string (e.g. "1-300" for seeds 1 through 300), or a list mixing ints and range strings (e.g. [1, 2, "5-7"]). Default: 42
     output_dir (str)                        Output directory. Default: ./fastQpick_output
     gzip_output (bool)                      Whether or not to gzip the output. Default: False (uncompressed)
     group_size (int)                        The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)
-    replacement (bool)                      Sample with replacement. Default: False (without replacement).
+    replacement (bool)                      Sample with replacement. Default: True (with replacement). Set to False to sample without replacement.
     overwrite (bool)                        Overwrite existing output files. Default: False
     low_memory (bool)                       Whether to use low memory mode (uses ~5.5x less memory than default, but adds marginal time to the data structure generation preprocessing). Default: False
     unique_headers (bool)                   Whether to add a unique identifier to the header names of the output files. Default: False
@@ -164,6 +189,8 @@ def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzi
         if os.path.exists(output_dir) and not is_directory_effectively_empty(output_dir):  # check if dir exists and is not empty
             raise FileExistsError(f"Output directory '{output_dir}' already exists. Please specify a different output directory or set the overwrite flag to True.")
 
+    seeds = parse_seed(seeds)  # normalize int / range string / iterable into a flat list of integer seeds (also keeps the config snapshot JSON-serializable)
+
     # Save arguments to a config file
     os.makedirs(output_dir, exist_ok=True)
     config_file = os.path.join(output_dir, "fastQpick_config.json")
@@ -175,33 +202,30 @@ def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzi
         replacement = True
 
     # go through files, and only keep those that are valid fastq files or that are a folder containing valid fastq files in the direct subdirectory
-    input_files_parsed = []
     if isinstance(input_files, str):
-        input_files_parsed = [input_files]
-    elif isinstance(input_files, tuple) or isinstance(input_files, list):
-        for path in input_files:
-            if not isinstance(path, str):
-                raise ValueError("Input file list must be a string, tuple of strings, or list of strings.")
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"File or directory '{path}' not found.")
-            elif os.path.isfile(path) and not path.endswith(tuple(valid_fastq_extensions)):
-                raise ValueError(f"File '{path}' is not a valid FASTQ file.")
-            elif os.path.isdir(path):
-                input_files_before_path = input_files_parsed.copy()
-                for subpath in os.listdir(path):
-                    if os.path.isfile(subpath) and subpath.endswith(tuple(valid_fastq_extensions)):
-                        input_files_parsed.append(subpath)
-                if input_files_before_path == input_files_parsed:
-                    raise ValueError(f"No valid FASTQ files found in directory '{path}'.")
-            elif os.path.isfile(path) and path.endswith(tuple(valid_fastq_extensions)):
-                input_files_parsed.append(path)
-    else:
+        input_files = [input_files]
+    elif not isinstance(input_files, (tuple, list)):
         raise ValueError("Input file list must be a string, tuple of strings, or list of strings.")
 
-    if isinstance(seed, int):  # if a single int is passed as a seed
-        seed = [seed]
-    elif isinstance(seed, str):  # if a string of comma-separated ints is passed as a seed (like on the command line)
-        seed = [int(specific_seed) for specific_seed in seed.split(",")]
+    input_files_parsed = []
+    for path in input_files:
+        if not isinstance(path, str):
+            raise ValueError("Input file list must be a string, tuple of strings, or list of strings.")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"File or directory '{path}' not found.")
+        elif os.path.isdir(path):
+            input_files_before_path = len(input_files_parsed)
+            # sorted() makes directory expansion deterministic, which matters for grouped/paired files
+            for subpath in sorted(os.listdir(path)):
+                full_subpath = os.path.join(path, subpath)
+                if os.path.isfile(full_subpath) and subpath.endswith(tuple(valid_fastq_extensions)):
+                    input_files_parsed.append(full_subpath)
+            if len(input_files_parsed) == input_files_before_path:
+                raise ValueError(f"No valid FASTQ files found in directory '{path}'.")
+        elif os.path.isfile(path) and not path.endswith(tuple(valid_fastq_extensions)):
+            raise ValueError(f"File '{path}' is not a valid FASTQ file.")
+        elif os.path.isfile(path) and path.endswith(tuple(valid_fastq_extensions)):
+            input_files_parsed.append(path)
 
     group_size = int(group_size)  # make sure group_size is an int (not a string)
     fraction = float(fraction)  # make sure fraction is a float (not a string)
@@ -213,17 +237,17 @@ def fastQpick(input_files, fraction, seed=42, output_dir="fastQpick_output", gzi
     make_fastq_to_length_dict(input_files_parsed, verbose=verbose)
 
     # Do the sampling
-    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seed, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, unique_headers=unique_headers, verbose=verbose)
+    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seeds, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, unique_headers=unique_headers, verbose=verbose)
 
 def main():
     # Create argument parser
     parser = argparse.ArgumentParser(description="Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement.")
-    parser.add_argument("-f", "--fraction", required=True, default=False, help="The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.")
-    parser.add_argument("-s", "--seed", required=False, default=42, help="Random seed(s). Can provide multiple seeds separated by commas. Default: 42")
+    parser.add_argument("-f", "--fraction", required=True, default=False, help="The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 forces sampling with replacement.")
+    parser.add_argument("-s", "--seeds", required=False, default=42, nargs="+", help="Random seed(s), space-separated. Each value is an integer (e.g. 42) or an inclusive dash-delimited range (e.g. 1-300 for seeds 1 through 300). The forms can be mixed, e.g. -s 1 5 10-12. Default: 42")
     parser.add_argument("-o", "--output_dir", required=False, type=str, default="fastQpick_output", help="Output file path. Default: ./fastQpick_output")
     parser.add_argument("-z", "--gzip_output", required=False, default=False, help="Whether or not to gzip the output. Default: False (uncompressed)")
     parser.add_argument("-g", "--group_size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)")
-    parser.add_argument("-r", "--replacement", action="store_true", help="Sample with replacement. Default: False (without replacement).")
+    parser.add_argument("-d", "--disable_replacement", action="store_true", help="Sample without replacement. By default, sampling is done with replacement.")
     parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files. Default: False")
     parser.add_argument("-l", "--low_memory", action="store_true", help="Whether to use low memory mode (uses ~5.5x less memory than default, but adds marginal time to the data structure generation preprocessing). Default: False")
     parser.add_argument("-u", "--unique_headers", action="store_true", help="Whether to add a unique identifier to the header names of the output files. Default: False")
@@ -238,11 +262,11 @@ def main():
             
     fastQpick(input_files=args.input_files,
               fraction=args.fraction,
-              seed=args.seed,
+              seeds=args.seeds,
               output_dir=args.output_dir,
               gzip_output=args.gzip_output,
               group_size=args.group_size,
-              replacement=args.replacement,
+              replacement=not args.disable_replacement,
               overwrite=args.overwrite,
               low_memory=args.low_memory,
               unique_headers=args.unique_headers,

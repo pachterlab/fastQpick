@@ -2,7 +2,8 @@ import os
 import tempfile
 import pytest
 from fastQpick import fastQpick
-from fastQpick.utils import read_fastq, count_reads
+from fastQpick.utils import read_fastq, count_reads, parse_seed
+from fastQpick.main import insert_seed_suffix
 from pdb import set_trace as st
 
 @pytest.fixture
@@ -91,6 +92,51 @@ IIIIIIIIIIIIIIIIIIIII
 
 
 
+
+def test_parse_seed():
+    # single int / single token string
+    assert parse_seed(42) == [42]
+    assert parse_seed("42") == [42]
+    assert parse_seed("1-5") == [1, 2, 3, 4, 5]
+    assert parse_seed("7-7") == [7]
+    assert parse_seed(" 3 - 4 ") == [3, 4]
+
+    # iterables of mixed ints and range strings
+    assert parse_seed([42, 43, 44]) == [42, 43, 44]
+    assert parse_seed(["42", "43"]) == [42, 43]
+    assert parse_seed([1, 2, "5-7"]) == [1, 2, 5, 6, 7]
+    assert parse_seed((1, "3-4")) == [1, 3, 4]
+    assert parse_seed(range(1, 4)) == [1, 2, 3]
+
+    with pytest.raises(ValueError):
+        parse_seed("5-1")  # end less than start
+    with pytest.raises(ValueError):
+        parse_seed("a-b")  # non-integer range
+    with pytest.raises(ValueError):
+        parse_seed("foo")  # non-integer seed
+    with pytest.raises(ValueError):
+        parse_seed("42,43,44")  # comma syntax no longer supported
+
+def test_seed_range_produces_multiple_outputs(temp_fastq_file):
+    fraction = 0.6
+    seed = "1-3"
+    gzip_output = False
+
+    with tempfile.TemporaryDirectory() as temp_output_dir:
+        fastQpick(input_files=temp_fastq_file,
+                fraction=fraction,
+                seeds=seed,
+                output_dir=temp_output_dir,
+                gzip_output=gzip_output,
+                group_size=1,
+                replacement=False,
+                overwrite=True
+                )
+
+        # One distinct output file per seed should be present, suffixed with the seed
+        output_files = sorted(f for f in os.listdir(temp_output_dir) if f.endswith(".fastq"))
+        expected = sorted(insert_seed_suffix(os.path.basename(temp_fastq_file), s) for s in (1, 2, 3))
+        assert output_files == expected, f"Expected {expected}, got {output_files}"
 
 def is_gzipped(file_path):
     with open(file_path, "rb") as f:
@@ -190,7 +236,7 @@ def test_single_file(temp_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
-                seed=seed,
+                seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
                 group_size=group_size,
@@ -210,7 +256,7 @@ def test_single_file_bootstrapped(temp_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
-                seed=seed,
+                seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
                 group_size=group_size,
@@ -232,7 +278,7 @@ def test_single_file_oversampled(temp_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
-                seed=seed,
+                seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
                 group_size=group_size,
@@ -254,7 +300,7 @@ def test_single_gzipped(temp_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
-                seed=seed,
+                seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
                 group_size=group_size,
@@ -277,7 +323,7 @@ def test_paired_files(temp_paired_fastq_files):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_paired_fastq_files,
                 fraction=fraction,
-                seed=seed,
+                seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
                 group_size=group_size,
@@ -302,7 +348,7 @@ def test_paired_files_bootstrapped(temp_paired_fastq_files):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_paired_fastq_files,
                 fraction=fraction,
-                seed=seed,
+                seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
                 group_size=group_size,
