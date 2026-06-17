@@ -156,4 +156,5 @@ CLAUDE.md
 main.*
 ref.bib
 .latexmkrc
+oup-*
 notebooks/figures
