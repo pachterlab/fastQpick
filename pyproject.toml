@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastQpick"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement."
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {file = "LICENSE"}
@@ -31,6 +31,7 @@ classifiers = [
 ]
 dependencies = [
     "pyfastx>=2.0.0",
+    "pydantic>=2.0.0",
     "tqdm>=4.66.0",
     "numpy>=1.7.0",
 ]

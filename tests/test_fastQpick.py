@@ -154,7 +154,8 @@ def test_one_pass_poisson_with_replacement(temp_large_fastq_file):
     n = count_reads(temp_large_fastq_file)
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seeds=42,
-                  output_dir=temp_output_dir, replacement=True, one_pass=True, overwrite=True, verbose=False)
+                  output_dir=temp_output_dir, replacement=True, unique_headers=False,
+                  one_pass=True, overwrite=True, verbose=False)
         output_fastq_file = os.path.join(temp_output_dir, os.path.basename(temp_large_fastq_file))
 
         num_out = count_reads(output_fastq_file)
@@ -172,7 +173,7 @@ def test_one_pass_pairwise_agreement(temp_large_paired_fastq_files):
     fraction = 0.6
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_large_paired_fastq_files, fraction=fraction, seeds=42,
-                  output_dir=temp_output_dir, group_size=2, replacement=False, one_pass=True,
+                  output_dir=temp_output_dir, file_group_size=2, replacement=False, one_pass=True,
                   overwrite=True, verbose=False)
 
         out1 = count_reads(os.path.join(temp_output_dir, os.path.basename(temp_large_paired_fastq_files[0])))
@@ -268,7 +269,7 @@ def test_seed_range_produces_multiple_outputs(temp_fastq_file):
                 seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
-                group_size=1,
+                file_group_size=1,
                 replacement=False,
                 overwrite=True
                 )
@@ -379,8 +380,9 @@ def test_single_file(temp_fastq_file):
                 seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
-                group_size=group_size,
+                file_group_size=group_size,
                 replacement=replacement,
+                unique_headers=False,
                 overwrite=True
                 )
         
@@ -399,8 +401,9 @@ def test_single_file_bootstrapped(temp_fastq_file):
                 seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
-                group_size=group_size,
+                file_group_size=group_size,
                 replacement=replacement,
+                unique_headers=False,
                 overwrite=True
                 )
         
@@ -421,8 +424,9 @@ def test_single_file_oversampled(temp_fastq_file):
                 seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
-                group_size=group_size,
+                file_group_size=group_size,
                 replacement=replacement,
+                unique_headers=False,
                 overwrite=True
                 )
         
@@ -443,8 +447,9 @@ def test_single_gzipped(temp_fastq_file):
                 seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
-                group_size=group_size,
+                file_group_size=group_size,
                 replacement=replacement,
+                unique_headers=False,
                 overwrite=True
                 )
         
@@ -466,8 +471,9 @@ def test_paired_files(temp_paired_fastq_files):
                 seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
-                group_size=group_size,
+                file_group_size=group_size,
                 replacement=replacement,
+                unique_headers=False,
                 overwrite=True
                 )
         
@@ -491,8 +497,9 @@ def test_paired_files_bootstrapped(temp_paired_fastq_files):
                 seeds=seed,
                 output_dir=temp_output_dir,
                 gzip_output=gzip_output,
-                group_size=group_size,
+                file_group_size=group_size,
                 replacement=replacement,
+                unique_headers=False,
                 overwrite=True
                 )
         

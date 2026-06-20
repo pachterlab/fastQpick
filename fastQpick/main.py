@@ -5,8 +5,12 @@ import random
 import numpy as np
 from tqdm import tqdm
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+from pydantic import ConfigDict, Field, validate_call
+from typing import Union
 import pyfastx  # to loop through fastq (faster than custom python code)
 
+from fastQpick import logger
 from fastQpick._version import __version__
 from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, group_items, count_reads, parse_seed
 
@@ -140,7 +144,7 @@ counter_sparsity_threshold = 100
 
 def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, low_memory, rng=None, verbose=True):
     if verbose:
-        print(f"Calculating total reads and determining random indices for seed {seed}, file {file}")
+        logger.info(f"Calculating total reads and determining random indices for seed {seed}, file {file}")
 
     use_counter = number_of_reads_to_sample < (total_reads / counter_sparsity_threshold)
 
@@ -218,20 +222,23 @@ def resolve_output_path(file, output_directory, gzip_output, multiple_seeds, see
         output_path = output_path[:-3]
     return output_path
 
-def bootstrap_single_file(files_total = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, low_memory = False, unique_headers = False, multiple_seeds = False, rng = None, verbose=True):
-    if isinstance(files_total, str):
-        files_total = (files_total, )
+def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, multiple_seeds, rng, verbose):
+    # Lazily yield (callable, kwargs) write jobs for one seed. Each group's occurrence list is built
+    # HERE, in the parent process, so the shared `rng` is consumed in exactly the same order as the
+    # single-process path; only the I/O-bound write_fastq call is handed off as a job. This keeps the
+    # default-path output byte-identical to the serial version while letting the writes run
+    # concurrently across files. Members of a group share one occurrence list, computed once.
+    for file in file_list:
+        files_total = (file, ) if isinstance(file, str) else file
 
-    total_reads = fastq_to_length_dict[files_total[0]]
-    number_of_reads_to_sample = int(fraction * total_reads)
+        total_reads = fastq_to_length_dict[files_total[0]]
+        number_of_reads_to_sample = int(fraction * total_reads)
 
-    occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, low_memory=low_memory, rng=rng, verbose=verbose)
+        occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, low_memory=low_memory, rng=rng, verbose=verbose)
 
-    for file in files_total:
-        output_path = resolve_output_path(file, output_directory, gzip_output, multiple_seeds, seed)
-
-        # write fastq
-        write_fastq(input_fastq = file, output_path = output_path, occurrence_list = occurrence_list, total_reads = total_reads, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, verbose = verbose)
+        for member in files_total:
+            output_path = resolve_output_path(member, output, gzip_output, multiple_seeds, seed)
+            yield write_fastq, dict(input_fastq=member, output_path=output_path, occurrence_list=occurrence_list, total_reads=total_reads, gzip_output=gzip_output, seed=seed, unique_headers=unique_headers, verbose=verbose)
 
 def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, unique_headers = False, multiple_seeds = False, verbose=True):
     # One-pass counterpart of bootstrap_single_file. No occurrence vector is materialized and the
@@ -245,25 +252,61 @@ def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_o
 
         write_fastq_one_pass(input_fastq = file, output_path = output_path, fraction = fraction, replacement = replacement, child_seed = child_seed, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, verbose = verbose)
 
+def run_write_jobs(jobs, max_workers):
+    # Execute (callable, kwargs) write jobs. The write stage is dominated by I/O (read, optional
+    # compression, write), so with more than one file the jobs are dispatched to a process pool to
+    # run concurrently; with a single file they run inline to avoid pool overhead. A sliding window
+    # caps the number of in-flight jobs at max_workers, so the parent never materializes more than
+    # max_workers occurrence lists at once and peak memory stays bounded.
+    if max_workers <= 1:
+        for func, kwargs in jobs:
+            func(**kwargs)
+        return
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        in_flight = set()
+        for func, kwargs in jobs:
+            while len(in_flight) >= max_workers:
+                done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    future.result()  # surface any worker exception
+            in_flight.add(executor.submit(func, **kwargs))
+        for future in in_flight:
+            future.result()
+
 def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, unique_headers, one_pass, verbose):
     multiple_seeds = len(seed_list) > 1
+    cpu_count = os.cpu_count() or 1
+    # Number of individual output files (groups expanded); this is the most write jobs that can run
+    # at once and so caps the worker count.
+    num_individual_files = sum(len(file) if isinstance(file, tuple) else 1 for file in file_list)
     for seed in seed_list:
         if one_pass:
             # Derive one independent sub-seed per group from the master seed. Members of a group
             # share their sub-seed (handled inside bootstrap_single_file_one_pass) so mates stay
             # synchronized, while different groups draw independently, mirroring the two-pass path
-            # where each file consumes fresh random state.
+            # where each file consumes fresh random state. Each group is fully independent, so a whole
+            # group is one parallel write job.
             child_seeds = np.random.SeedSequence(seed).spawn(len(file_list))
-            for file, child_seed in zip(file_list, child_seeds):
-                bootstrap_single_file_one_pass(files_total = file, child_seed = child_seed, gzip_output = gzip_output, output_directory = output, seed = seed, fraction = fraction, replacement = replacement, unique_headers = unique_headers, multiple_seeds = multiple_seeds, verbose = verbose)
+            jobs = (
+                (bootstrap_single_file_one_pass,
+                 dict(files_total=file, child_seed=child_seed, gzip_output=gzip_output, output_directory=output, seed=seed, fraction=fraction, replacement=replacement, unique_headers=unique_headers, multiple_seeds=multiple_seeds, verbose=verbose))
+                for file, child_seed in zip(file_list, child_seeds)
+            )
+            max_workers = min(len(file_list), cpu_count)
         else:
             # Seed both RNGs once per seed: stdlib random drives the low-memory path, and a numpy
             # Generator drives the default path. A single Generator is shared across the seed's files
-            # so that successive files draw independent samples while remaining reproducible.
+            # so that successive files draw independent samples while remaining reproducible. The
+            # occurrence lists are built serially in this process (inside two_pass_write_jobs), so the
+            # shared RNG is consumed in order and the output is independent of how the writes are
+            # scheduled across processes.
             random.seed(seed)
             rng = np.random.default_rng(seed)
-            for file in file_list:
-                bootstrap_single_file(files_total = file, gzip_output = gzip_output, output_directory = output, seed = seed, fraction = fraction, replacement = replacement, low_memory = low_memory, unique_headers = unique_headers, multiple_seeds = multiple_seeds, rng = rng, verbose = verbose)
+            jobs = two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, multiple_seeds, rng, verbose)
+            max_workers = min(num_individual_files, cpu_count)
+
+        run_write_jobs(jobs, max_workers=max_workers)
     
 def make_fastq_to_length_dict(file_list, verbose=True):
     global fastq_to_length_dict
@@ -272,7 +315,7 @@ def make_fastq_to_length_dict(file_list, verbose=True):
             if all(specific_file in fastq_to_length_dict for specific_file in file):
                 continue
             if verbose:
-                print(f"Counting {file[0]}")
+                logger.info(f"Counting {file[0]}")
             count = count_reads(file[0])
             for i in range(len(file)):
                 fastq_to_length_dict[file[i]] = count
@@ -280,30 +323,45 @@ def make_fastq_to_length_dict(file_list, verbose=True):
             if file in fastq_to_length_dict:
                 continue
             if verbose:
-                print(f"Counting {file}")
+                logger.info(f"Counting {file}")
             count = count_reads(file)
             fastq_to_length_dict[file] = count
     if verbose:
-        print("fastq_to_length_dict:", fastq_to_length_dict)
+        logger.info(f"fastq_to_length_dict: {fastq_to_length_dict}")
 
-def fastQpick(input_files, fraction, seeds=42, output_dir="fastQpick_output", gzip_output=False, group_size=1, replacement=True, overwrite=False, low_memory=False, unique_headers=False, one_pass=False, verbose=True, **kwargs):
+@validate_call
+def fastQpick(
+    input_files: str | list | tuple,
+    fraction: float = 1.0,
+    seeds: int | str | list = 42,
+    output_dir: str = "fastQpick_output",
+    gzip_output: bool = False,
+    file_group_size: int = 1,
+    replacement: bool = True,
+    overwrite: bool = False,
+    low_memory: bool = False,
+    unique_headers: Union[bool, None] = None,
+    one_pass: bool = False,
+    verbose: bool = True,
+    **kwargs
+):
     """
     Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement.
 
     Parameters
     ----------
-    input_files (str, list, or tuple)       List of input FASTQ files or directories containing FASTQ files.
-    fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 will turn on the -r flag automatically.
-    seeds (int, str, or list)               Random seed(s). Provide a single int (e.g. 42), an inclusive dash-delimited range string (e.g. "1-300" for seeds 1 through 300), or a list mixing ints and range strings (e.g. [1, 2, "5-7"]). Default: 42
-    output_dir (str)                        Output directory. Default: ./fastQpick_output
-    gzip_output (bool)                      Whether or not to gzip the output. Default: False (uncompressed)
-    group_size (int)                        The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)
-    replacement (bool)                      Sample with replacement. Default: True (with replacement). Set to False to sample without replacement.
-    overwrite (bool)                        Overwrite existing output files. Default: False
-    low_memory (bool)                       Whether to use low memory mode (uses ~5x less memory than default, but adds marginal time to the data structure generation preprocessing). Has no effect in one_pass mode, which is already O(1) memory. Default: False
-    unique_headers (bool)                   Whether to add a unique identifier to the header names of the output files. Default: False
-    one_pass (bool)                         Whether to use the single-pass approximate sampler. Skips the read-counting pass and instead draws each read's output multiplicity independently (Poisson(fraction) with replacement, Bernoulli(fraction) without), giving O(1) memory and roughly half the read I/O at the cost of an output size that is fraction*n only in expectation (relative standard deviation ~1/sqrt(fraction*n)). Default: False
-    verbose (bool)                          Whether to print progress information. Default: True
+    input_files (str, list, or tuple)       Input FASTQ files or directories containing FASTQ files.
+    fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 turns on sampling with replacement automatically.
+    seeds (int, str, or list)               Random seed(s). Provide a single int (e.g. 42), an inclusive dash-delimited range string (e.g. "1-300" for seeds 1 through 300), or a list mixing ints and range strings (e.g. [1, 2, "5-7"]).
+    output_dir (str)                        Output directory.
+    gzip_output (bool)                      Gzip the output files.
+    file_group_size (int)                        The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.
+    replacement (bool)                      Sample with replacement. Automatically enabled if fraction >= 1.
+    overwrite (bool)                        Overwrite existing output files.
+    low_memory (bool)                       Activate low memory mode. Disabled if one_pass is True.
+    unique_headers (bool)                   Add a unique identifier to the header names of the output files. Default True if replacement is True, False if replacement is False.
+    one_pass (bool)                         Use the single-pass approximate sampler. Uses low memory and runs faster in some cases (when the fraction is small or the input is large compared to available memory).
+    verbose (bool)                          Whether to print progress information.
 
     kwargs
     ------
@@ -334,7 +392,7 @@ def fastQpick(input_files, fraction, seeds=42, output_dir="fastQpick_output", gz
     # low_memory only governs the two-pass occurrence-vector construction; the one-pass sampler
     # never builds that vector, so the flag has nothing to act on there.
     if one_pass and low_memory and verbose:
-        print("Note: low_memory has no effect in one_pass mode, which already runs in O(1) memory.")
+        logger.warning("low_memory has no effect in one_pass mode, which already runs in O(1) memory.")
 
     # go through files, and only keep those that are valid fastq files or that are a folder containing valid fastq files in the direct subdirectory
     if isinstance(input_files, str):
@@ -362,11 +420,18 @@ def fastQpick(input_files, fraction, seeds=42, output_dir="fastQpick_output", gz
         elif os.path.isfile(path) and path.endswith(tuple(valid_fastq_extensions)):
             input_files_parsed.append(path)
 
-    group_size = int(group_size)  # make sure group_size is an int (not a string)
+    file_group_size = int(file_group_size)  # make sure file_group_size is an int (not a string)
     fraction = float(fraction)  # make sure fraction is a float (not a string)
 
-    if group_size > 1:
-        input_files_parsed = group_items(input_files_parsed, group_size=group_size)
+    if file_group_size > 1:
+        input_files_parsed = group_items(input_files_parsed, group_size=file_group_size)
+    
+    if unique_headers is None:
+        unique_headers = replacement  # default to True if replacement is True, False if replacement is False
+    if replacement and not unique_headers:
+        logger.warning(f"unique_headers is {unique_headers} but replacement is {replacement}. This may lead to duplicate header names in the output files, which can cause issues for downstream tools. Consider setting unique_headers to {replacement} to match the replacement setting.")
+    if not replacement and unique_headers:
+        logger.warning(f"unique_headers is {unique_headers} but replacement is {replacement}. This may lead to unnecessarily verbose header names in the output files. Consider setting unique_headers to {replacement} to match the replacement setting.")
     
     # Count reads in each file and store in a dictionary. The one-pass sampler does not need the
     # counts, so this pass is skipped entirely in that mode.
@@ -379,21 +444,21 @@ def fastQpick(input_files, fraction, seeds=42, output_dir="fastQpick_output", gz
 def main():
     # Create argument parser
     parser = argparse.ArgumentParser(description="Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement.")
-    parser.add_argument("-f", "--fraction", required=True, default=False, help="The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 forces sampling with replacement.")
-    parser.add_argument("-s", "--seeds", required=False, default=42, nargs="+", help="Random seed(s), space-separated. Each value is an integer (e.g. 42) or an inclusive dash-delimited range (e.g. 1-300 for seeds 1 through 300). The forms can be mixed, e.g. -s 1 5 10-12. Default: 42")
-    parser.add_argument("-o", "--output_dir", required=False, type=str, default="fastQpick_output", help="Output file path. Default: ./fastQpick_output")
-    parser.add_argument("-z", "--gzip_output", required=False, default=False, help="Whether or not to gzip the output. Default: False (uncompressed)")
-    parser.add_argument("-g", "--group_size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have group_size=3. Default: 1 (unpaired)")
-    parser.add_argument("-d", "--disable_replacement", action="store_true", help="Sample without replacement. By default, sampling is done with replacement.")
-    parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files. Default: False")
-    parser.add_argument("-l", "--low_memory", action="store_true", help="Whether to use low memory mode (uses ~5x less memory than default, but adds marginal time to the data structure generation preprocessing). Default: False")
-    parser.add_argument("-u", "--unique_headers", action="store_true", help="Whether to add a unique identifier to the header names of the output files. Default: False")
-    parser.add_argument("-p", "--one_pass", action="store_true", help="Use the single-pass approximate sampler: skip the read-counting pass and draw each read's output multiplicity independently (Poisson with replacement, Bernoulli without). Runs in O(1) memory with roughly half the read I/O; the output size equals fraction*n only in expectation. Default: False")
-    parser.add_argument("-q", "--quiet", action="store_false", help="Turn off verbose output. Default: False")
+    parser.add_argument("-f", "--fraction", required=True, default=False, help="The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 turns on sampling with replacement automatically.")
+    parser.add_argument("-s", "--seeds", required=False, default=42, nargs="+", help='Random seed(s). Provide a single int (e.g. 42), an inclusive dash-delimited range string (e.g. "1-300" for seeds 1 through 300), or a list mixing ints and range strings (e.g. [1, 2, "5-7"]).')
+    parser.add_argument("-o", "--output-dir", required=False, type=str, default="fastQpick_output", help="Output directory.")
+    parser.add_argument("-z", "--gzip-output", required=False, default=False, help="Gzip the output files.")
+    parser.add_argument("-g", "--file-group-size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.")
+    parser.add_argument("-dr", "--disable-replacement", action="store_true", help="Sample with replacement. Automatically enabled if fraction >= 1.")
+    parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files.")
+    parser.add_argument("-l", "--low-memory", action="store_true", help="Activate low memory mode. Disabled if one_pass is True.")
+    parser.add_argument("-u", "--unique-headers", action="store_true", default=None, help="Add a unique identifier to the header names of the output files. Defaults to True when sampling with replacement, False otherwise.")
+    parser.add_argument("-p", "--one_pass", action="store_true", help="Use the single-pass approximate sampler. Uses low memory and runs faster in some cases (when the fraction is small or the input is large compared to available memory).")
+    parser.add_argument("-q", "--quiet", action="store_false", help="Whether to print progress information.")
     parser.add_argument("-v", "--version", action="version", version=f"fastQpick {__version__}", help="Show program's version number and exit")
 
     # Positional argument for input files (indefinite number)
-    parser.add_argument("input_files", nargs="+", help="Input FASTQ file(s) (one after the other, space-separated) or FASTQ folder(s)")
+    parser.add_argument("input_files", nargs="+", help="Input FASTQ files or directories containing FASTQ files.")
 
     # Parse arguments
     args = parser.parse_args()
@@ -403,7 +468,7 @@ def main():
               seeds=args.seeds,
               output_dir=args.output_dir,
               gzip_output=args.gzip_output,
-              group_size=args.group_size,
+              file_group_size=args.file_group_size,
               replacement=not args.disable_replacement,
               overwrite=args.overwrite,
               low_memory=args.low_memory,

@@ -5,6 +5,8 @@ import os
 from collections import OrderedDict
 import pyfastx
 
+from fastQpick import logger
+
 def count_reads(filepath):
     fastq_file = pyfastx.Fastx(filepath)
     num_reads = sum(1 for _ in fastq_file)
@@ -135,6 +137,8 @@ def save_params_to_config_file(out_file="run_config.json"):
     # Write to JSON
     with open(out_file, "w") as file:
         json.dump(params, file, indent=4)
+
+    logger.debug(f"Wrote run parameters to {out_file}")
 
 
 def is_directory_effectively_empty(directory_path):
