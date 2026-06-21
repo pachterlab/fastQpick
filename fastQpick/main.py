@@ -1,5 +1,4 @@
 import argparse
-import gzip
 import os
 import random
 import numpy as np
@@ -14,6 +13,13 @@ from fastQpick import logger
 from fastQpick._version import __version__
 from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, group_items, count_reads, parse_seed
 
+try:
+    from isal import igzip as gzip
+    gzip_compresslevel = 1
+except ImportError:
+    import gzip
+    gzip_compresslevel = 6
+
 # Global variables
 valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 batch_size = 200000  # for buffer
@@ -21,7 +27,7 @@ fastq_to_length_dict = {}  # set to empty, and the user can provide otherwise it
 
 def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, unique_headers = False, verbose = True):
     if gzip_output:
-        open_func = gzip.open
+        open_func = lambda path, mode: gzip.open(path, mode, compresslevel=gzip_compresslevel)
         write_mode = "wt"
     else:
         open_func = open
@@ -84,7 +90,7 @@ def write_fastq_one_pass(input_fastq, output_path, fraction, replacement, child_
     # group are passed the same child_seed, so re-seeding here reproduces the identical multiplicity
     # sequence for every member and keeps mate pairs synchronized without a shared occurrence vector.
     if gzip_output:
-        open_func = gzip.open
+        open_func = lambda path, mode: gzip.open(path, mode, compresslevel=gzip_compresslevel)
         write_mode = "wt"
     else:
         open_func = open
@@ -333,11 +339,12 @@ def make_fastq_to_length_dict(file_list, verbose=True):
 def fastQpick(
     input_files: str | list | tuple,
     fraction: float = 1.0,
-    seeds: int | str | list = 42,
+    seed: int | str | list = 42,
+    num_samples: int = 1,
     output_dir: str = "fastQpick_output",
-    gzip_output: bool = False,
+    disable_gzip: bool = False,
     file_group_size: int = 1,
-    replacement: bool = True,
+    without_replacement: bool = False,
     overwrite: bool = False,
     low_memory: bool = False,
     unique_headers: Union[bool, None] = None,
@@ -352,14 +359,15 @@ def fastQpick(
     ----------
     input_files (str, list, or tuple)       Input FASTQ files or directories containing FASTQ files.
     fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 turns on sampling with replacement automatically.
-    seeds (int, str, or list)               Random seed(s). Provide a single int (e.g. 42), an inclusive dash-delimited range string (e.g. "1-300" for seeds 1 through 300), or a list mixing ints and range strings (e.g. [1, 2, "5-7"]).
+    seed (int)                              Random seed.
+    num_samples (int)                       Number of independent samples (replicates) to generate.
     output_dir (str)                        Output directory.
-    gzip_output (bool)                      Gzip the output files.
-    file_group_size (int)                        The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.
-    replacement (bool)                      Sample with replacement. Automatically enabled if fraction >= 1.
+    disable_gzip (bool)                     Write plain (uncompressed) FASTQ. Output is gzip-compressed by default.
+    file_group_size (int)                   The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.
+    without_replacement (bool)              Sample without replacement. Automatically disabled if fraction >= 1.
     overwrite (bool)                        Overwrite existing output files.
     low_memory (bool)                       Activate low memory mode. Disabled if one_pass is True.
-    unique_headers (bool)                   Add a unique identifier to the header names of the output files. Default True if replacement is True, False if replacement is False.
+    unique_headers (bool)                   Add a unique identifier to the header names of the output files. Default False if without_replacement is True, True if without_replacement is False.
     one_pass (bool)                         Use the single-pass approximate sampler. Uses low memory and runs faster in some cases (when the fraction is small or the input is large compared to available memory).
     verbose (bool)                          Whether to print progress information.
 
@@ -367,6 +375,9 @@ def fastQpick(
     ------
     fastq_to_length_dict (dict)             Dictionary of FASTQ file paths to number of reads in each file. If not provided, will be calculated.
     """
+    replacement = not without_replacement
+    gzip_output = not disable_gzip  # output is gzip-compressed by default
+
     # check if fastq_to_length_dict is in kwargs
     if "fastq_to_length_dict" in kwargs and isinstance(kwargs["fastq_to_length_dict"], dict):
         global fastq_to_length_dict
@@ -377,7 +388,17 @@ def fastQpick(
         if os.path.exists(output_dir) and not is_directory_effectively_empty(output_dir):  # check if dir exists and is not empty
             raise FileExistsError(f"Output directory '{output_dir}' already exists. Please specify a different output directory or set the overwrite flag to True.")
 
-    seeds = parse_seed(seeds)  # normalize int / range string / iterable into a flat list of integer seeds (also keeps the config snapshot JSON-serializable)
+    # Normalize the seed specification into a flat list of integer seeds. The seed argument doubles as a
+    # (hidden) way to request multiple samples for backwards compatibility: if it expands to more than one
+    # seed (a list or a dash-delimited range string), each seed produces one sample and num_samples is
+    # overridden to match. For a single seed, num_samples consecutive seeds are derived from it so that
+    # num_samples controls the number of independent replicates. With the defaults (seed=42, num_samples=1)
+    # this yields the single seed 42. The user need not be aware of this seed/num_samples interplay.
+    seeds = parse_seed(seed)
+    if len(seeds) > 1:
+        num_samples = len(seeds)
+    else:
+        seeds = list(range(seeds[0], seeds[0] + num_samples))
 
     # Save arguments to a config file
     os.makedirs(output_dir, exist_ok=True)
@@ -445,11 +466,12 @@ def main():
     # Create argument parser
     parser = argparse.ArgumentParser(description="Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement.")
     parser.add_argument("-f", "--fraction", required=True, default=False, help="The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 turns on sampling with replacement automatically.")
-    parser.add_argument("-s", "--seeds", required=False, default=42, nargs="+", help='Random seed(s). Provide a single int (e.g. 42), an inclusive dash-delimited range string (e.g. "1-300" for seeds 1 through 300), or a list mixing ints and range strings (e.g. [1, 2, "5-7"]).')
+    parser.add_argument("-s", "--seed", required=False, default=42, nargs="+", help='Random seed.')
+    parser.add_argument("-B", "-n", "--num-samples", required=False, type=int, default=1, help="Number of independent samples (replicates) to generate")
     parser.add_argument("-o", "--output-dir", required=False, type=str, default="fastQpick_output", help="Output directory.")
-    parser.add_argument("-z", "--gzip-output", required=False, default=False, help="Gzip the output files.")
+    parser.add_argument("-z", "--disable-gzip", action="store_true", help="Write plain (uncompressed) FASTQ. Output is gzip-compressed by default.")
     parser.add_argument("-g", "--file-group-size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.")
-    parser.add_argument("-dr", "--disable-replacement", action="store_true", help="Sample with replacement. Automatically enabled if fraction >= 1.")
+    parser.add_argument("-dr", "--without-replacement", action="store_true", help="Sample without replacement. Automatically disabled if fraction >= 1.")
     parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files.")
     parser.add_argument("-l", "--low-memory", action="store_true", help="Activate low memory mode. Disabled if one_pass is True.")
     parser.add_argument("-u", "--unique-headers", action="store_true", default=None, help="Add a unique identifier to the header names of the output files. Defaults to True when sampling with replacement, False otherwise.")
@@ -465,11 +487,12 @@ def main():
             
     fastQpick(input_files=args.input_files,
               fraction=args.fraction,
-              seeds=args.seeds,
+              seed=args.seed,
+              num_samples=args.num_samples,
               output_dir=args.output_dir,
-              gzip_output=args.gzip_output,
+              disable_gzip=args.disable_gzip,
               file_group_size=args.file_group_size,
-              replacement=not args.disable_replacement,
+              without_replacement=args.without_replacement,
               overwrite=args.overwrite,
               low_memory=args.low_memory,
               unique_headers=args.unique_headers,

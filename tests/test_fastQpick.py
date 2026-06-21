@@ -130,8 +130,9 @@ def test_one_pass_bernoulli_without_replacement(temp_large_fastq_file):
     fraction = 0.5
     n = count_reads(temp_large_fastq_file)
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seeds=42,
-                  output_dir=temp_output_dir, replacement=False, one_pass=True, overwrite=True, verbose=False)
+        fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=42,
+                  output_dir=temp_output_dir, without_replacement=True, one_pass=True, overwrite=True, verbose=False,
+                  disable_gzip=True)
         output_fastq_file = os.path.join(temp_output_dir, os.path.basename(temp_large_fastq_file))
 
         input_fastq_dict = make_fastq_dict(temp_large_fastq_file)
@@ -153,9 +154,9 @@ def test_one_pass_poisson_with_replacement(temp_large_fastq_file):
     fraction = 2.0
     n = count_reads(temp_large_fastq_file)
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seeds=42,
-                  output_dir=temp_output_dir, replacement=True, unique_headers=False,
-                  one_pass=True, overwrite=True, verbose=False)
+        fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=42,
+                  output_dir=temp_output_dir, without_replacement=False, unique_headers=False,
+                  one_pass=True, overwrite=True, verbose=False, disable_gzip=True)
         output_fastq_file = os.path.join(temp_output_dir, os.path.basename(temp_large_fastq_file))
 
         num_out = count_reads(output_fastq_file)
@@ -172,9 +173,9 @@ def test_one_pass_pairwise_agreement(temp_large_paired_fastq_files):
     # multiplicities from a shared per-group sub-seed.
     fraction = 0.6
     with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_files=temp_large_paired_fastq_files, fraction=fraction, seeds=42,
-                  output_dir=temp_output_dir, file_group_size=2, replacement=False, one_pass=True,
-                  overwrite=True, verbose=False)
+        fastQpick(input_files=temp_large_paired_fastq_files, fraction=fraction, seed=42,
+                  output_dir=temp_output_dir, file_group_size=2, without_replacement=True, one_pass=True,
+                  overwrite=True, verbose=False, disable_gzip=True)
 
         out1 = count_reads(os.path.join(temp_output_dir, os.path.basename(temp_large_paired_fastq_files[0])))
         out2 = count_reads(os.path.join(temp_output_dir, os.path.basename(temp_large_paired_fastq_files[1])))
@@ -189,8 +190,9 @@ def test_one_pass_is_deterministic(temp_large_fastq_file):
     fraction = 0.4
     with tempfile.TemporaryDirectory() as dir1, tempfile.TemporaryDirectory() as dir2:
         for out_dir in (dir1, dir2):
-            fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seeds=123,
-                      output_dir=out_dir, replacement=True, one_pass=True, overwrite=True, verbose=False)
+            fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=123,
+                      output_dir=out_dir, without_replacement=False, one_pass=True, overwrite=True, verbose=False,
+                      disable_gzip=True)
         base = os.path.basename(temp_large_fastq_file)
         with open(os.path.join(dir1, base)) as f1, open(os.path.join(dir2, base)) as f2:
             assert f1.read() == f2.read(), "one-pass output must be deterministic for a fixed seed"
@@ -227,8 +229,9 @@ def test_default_mode_is_reproducible(temp_large_fastq_file):
     fraction = 0.5
     with tempfile.TemporaryDirectory() as dir1, tempfile.TemporaryDirectory() as dir2:
         for out_dir in (dir1, dir2):
-            fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seeds=7,
-                      output_dir=out_dir, replacement=True, overwrite=True, verbose=False)
+            fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=7,
+                      output_dir=out_dir, without_replacement=False, overwrite=True, verbose=False,
+                      disable_gzip=True)
         base = os.path.basename(temp_large_fastq_file)
         with open(os.path.join(dir1, base)) as f1, open(os.path.join(dir2, base)) as f2:
             assert f1.read() == f2.read(), "default-mode output must be deterministic for a fixed seed"
@@ -266,17 +269,41 @@ def test_seed_range_produces_multiple_outputs(temp_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
-                seeds=seed,
+                seed=seed,
                 output_dir=temp_output_dir,
-                gzip_output=gzip_output,
+                disable_gzip=not gzip_output,
                 file_group_size=1,
-                replacement=False,
+                without_replacement=True,
                 overwrite=True
                 )
 
         # One distinct output file per seed should be present, suffixed with the seed
         output_files = sorted(f for f in os.listdir(temp_output_dir) if f.endswith(".fastq"))
         expected = sorted(insert_seed_suffix(os.path.basename(temp_fastq_file), s) for s in (1, 2, 3))
+        assert output_files == expected, f"Expected {expected}, got {output_files}"
+
+
+def test_num_samples_produces_multiple_outputs(temp_fastq_file):
+    # num_samples derives consecutive seeds from a single base seed, producing one output per replicate.
+    fraction = 0.6
+    seed = 5
+    num_samples = 3
+
+    with tempfile.TemporaryDirectory() as temp_output_dir:
+        fastQpick(input_files=temp_fastq_file,
+                fraction=fraction,
+                seed=seed,
+                num_samples=num_samples,
+                output_dir=temp_output_dir,
+                disable_gzip=True,
+                file_group_size=1,
+                without_replacement=True,
+                overwrite=True
+                )
+
+        # num_samples consecutive seeds (5, 6, 7) each yield one suffixed output file
+        output_files = sorted(f for f in os.listdir(temp_output_dir) if f.endswith(".fastq"))
+        expected = sorted(insert_seed_suffix(os.path.basename(temp_fastq_file), s) for s in (5, 6, 7))
         assert output_files == expected, f"Expected {expected}, got {output_files}"
 
 def is_gzipped(file_path):
@@ -377,11 +404,11 @@ def test_single_file(temp_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
-                seeds=seed,
+                seed=seed,
                 output_dir=temp_output_dir,
-                gzip_output=gzip_output,
+                disable_gzip=not gzip_output,
                 file_group_size=group_size,
-                replacement=replacement,
+                without_replacement=not replacement,
                 unique_headers=False,
                 overwrite=True
                 )
@@ -398,11 +425,11 @@ def test_single_file_bootstrapped(temp_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
-                seeds=seed,
+                seed=seed,
                 output_dir=temp_output_dir,
-                gzip_output=gzip_output,
+                disable_gzip=not gzip_output,
                 file_group_size=group_size,
-                replacement=replacement,
+                without_replacement=not replacement,
                 unique_headers=False,
                 overwrite=True
                 )
@@ -421,11 +448,11 @@ def test_single_file_oversampled(temp_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
-                seeds=seed,
+                seed=seed,
                 output_dir=temp_output_dir,
-                gzip_output=gzip_output,
+                disable_gzip=not gzip_output,
                 file_group_size=group_size,
-                replacement=replacement,
+                without_replacement=not replacement,
                 unique_headers=False,
                 overwrite=True
                 )
@@ -444,11 +471,11 @@ def test_single_gzipped(temp_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_fastq_file,
                 fraction=fraction,
-                seeds=seed,
+                seed=seed,
                 output_dir=temp_output_dir,
-                gzip_output=gzip_output,
+                disable_gzip=not gzip_output,
                 file_group_size=group_size,
-                replacement=replacement,
+                without_replacement=not replacement,
                 unique_headers=False,
                 overwrite=True
                 )
@@ -468,11 +495,11 @@ def test_paired_files(temp_paired_fastq_files):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_paired_fastq_files,
                 fraction=fraction,
-                seeds=seed,
+                seed=seed,
                 output_dir=temp_output_dir,
-                gzip_output=gzip_output,
+                disable_gzip=not gzip_output,
                 file_group_size=group_size,
-                replacement=replacement,
+                without_replacement=not replacement,
                 unique_headers=False,
                 overwrite=True
                 )
@@ -494,11 +521,11 @@ def test_paired_files_bootstrapped(temp_paired_fastq_files):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_paired_fastq_files,
                 fraction=fraction,
-                seeds=seed,
+                seed=seed,
                 output_dir=temp_output_dir,
-                gzip_output=gzip_output,
+                disable_gzip=not gzip_output,
                 file_group_size=group_size,
-                replacement=replacement,
+                without_replacement=not replacement,
                 unique_headers=False,
                 overwrite=True
                 )
