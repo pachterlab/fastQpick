@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import itertools
 import os
 import random
 import numpy as np
@@ -25,7 +27,38 @@ valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 batch_size = 200000  # for buffer
 fastq_to_length_dict = {}  # set to empty, and the user can provide otherwise it will be calculated
 
-def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, unique_headers = False, verbose = True):
+def write_reads_tagged(read_count_pairs, f, f_oob, unique_headers, collapse_duplicates):
+    # General writer used when collapse_duplicates and/or oob is requested (the plain writers below
+    # keep their specialized loops, since they are the hot path). read_count_pairs yields
+    # ((name, seq, qual), count). With collapse_duplicates each sampled read is written once and its
+    # multiplicity is recorded in the header as ";size=<count>" (the USEARCH/VSEARCH abundance
+    # convention), so the multiset is preserved without physically duplicating records. With f_oob,
+    # the out-of-bag reads (count == 0) are written, unmodified, to that second handle.
+    buffer = []
+    oob_buffer = []
+    for i, ((name, seq, qual), count) in enumerate(read_count_pairs):
+        if count:
+            if collapse_duplicates:
+                buffer.append(f"@{name};size={count}\n{seq}\n+\n{qual}\n")
+            elif unique_headers:
+                buffer.extend([f"@{name}_{j}\n{seq}\n+\n{qual}\n" for j in range(1, count+1)])
+            else:
+                buffer.append(f"@{name}\n{seq}\n+\n{qual}\n" * int(count))
+        elif f_oob is not None:
+            oob_buffer.append(f"@{name}\n{seq}\n+\n{qual}\n")
+
+        if (i + 1) % batch_size == 0:
+            f.writelines(buffer)
+            buffer.clear()
+            if oob_buffer:
+                f_oob.writelines(oob_buffer)
+                oob_buffer.clear()
+
+    f.writelines(buffer)
+    if oob_buffer:
+        f_oob.writelines(oob_buffer)
+
+def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, unique_headers = False, collapse_duplicates = False, oob_path = None, verbose = True):
     if gzip_output:
         open_func = lambda path, mode: gzip.open(path, mode, compresslevel=gzip_compresslevel)
         write_mode = "wt"
@@ -43,6 +76,15 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
         if verbose else input_fastq_read_only
     )
     
+    if collapse_duplicates or oob_path:
+        # occurrence_list is indexed by read position (dense array or Counter), so pair each read with its count lazily
+        counts = map(occurrence_list.__getitem__, itertools.count())
+        with contextlib.ExitStack() as stack:
+            f = stack.enter_context(open_func(output_path, write_mode))
+            f_oob = stack.enter_context(open_func(oob_path, write_mode)) if oob_path else None
+            write_reads_tagged(zip(iterator, counts), f, f_oob, unique_headers, collapse_duplicates)
+        return
+
     with open_func(output_path, write_mode) as f:
         if not unique_headers:  # original (non-unique) headers
             for i, (name, seq, qual) in enumerate(iterator):
@@ -84,7 +126,7 @@ def occurrence_chunk_stream(rng, fraction, replacement, chunk_size):
         for count in chunk:
             yield count
 
-def write_fastq_one_pass(input_fastq, output_path, fraction, replacement, child_seed, gzip_output, seed=None, unique_headers=False, verbose=True):
+def write_fastq_one_pass(input_fastq, output_path, fraction, replacement, child_seed, gzip_output, seed=None, unique_headers=False, collapse_duplicates=False, oob_path=None, verbose=True):
     # Single-pass writer. A read's output multiplicity is drawn as the file streams by, so the read
     # count is never needed and peak memory is constant (only the flush buffer). All members of a
     # group are passed the same child_seed, so re-seeding here reproduces the identical multiplicity
@@ -108,6 +150,13 @@ def write_fastq_one_pass(input_fastq, output_path, fraction, replacement, child_
         tqdm(input_fastq_read_only, desc=f"Iterating through seed {seed}, file {input_fastq}", unit="read")
         if verbose else input_fastq_read_only
     )
+
+    if collapse_duplicates or oob_path:
+        with contextlib.ExitStack() as stack:
+            f = stack.enter_context(open_func(output_path, write_mode))
+            f_oob = stack.enter_context(open_func(oob_path, write_mode)) if oob_path else None
+            write_reads_tagged(zip(iterator, occurrence_stream), f, f_oob, unique_headers, collapse_duplicates)
+        return
 
     with open_func(output_path, write_mode) as f:
         if not unique_headers:  # original (non-unique) headers
@@ -148,11 +197,36 @@ def smallest_uint_dtype(max_value):
 # length-n bincount temporary) wins, above it the dense array wins.
 counter_sparsity_threshold = 100
 
+# Chunk length for the low-memory without-replacement sampler (see make_occurrence_list).
+low_memory_chunk_size = 1_000_000
+
 def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, low_memory, rng=None, verbose=True):
     if verbose:
         logger.info(f"Calculating total reads and determining random indices for seed {seed}, file {file}")
 
     use_counter = number_of_reads_to_sample < (total_reads / counter_sparsity_threshold)
+
+    if low_memory and not replacement and not use_counter:
+        # random.sample would hold a set of m indices (as Python ints), which for a large sample costs far
+        # more than the occurrence array itself. Instead the reads are visited in fixed-size chunks: the
+        # number drawn from each chunk is Hypergeometric in the reads and draws still remaining, and those
+        # reads are chosen uniformly within the chunk. This is exactly uniform sampling without replacement
+        # and uses memory proportional to the chunk size only.
+        occurrence_list = np.zeros(total_reads, dtype=np.uint8)
+        remaining_draws = number_of_reads_to_sample
+        for start in range(0, total_reads, low_memory_chunk_size):
+            chunk_len = min(low_memory_chunk_size, total_reads - start)
+            remaining_reads = total_reads - start
+            if remaining_draws <= 0:
+                break
+            if remaining_draws >= remaining_reads:
+                k = chunk_len
+            else:
+                k = int(rng.hypergeometric(remaining_draws, remaining_reads - remaining_draws, chunk_len))
+            if k:
+                occurrence_list[start + rng.choice(chunk_len, size=k, replace=False)] = 1
+                remaining_draws -= k
+        return occurrence_list
 
     if low_memory:
         if replacement:
@@ -204,13 +278,16 @@ def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, rep
 
     return occurrence_list
 
-def insert_seed_suffix(filename, seed):
-    # Insert a per-seed marker before the FASTQ extension, e.g. "R1.fastq.gz" -> "R1.seed3.fastq.gz",
-    # so that distinct seeds write to distinct output files instead of overwriting one another.
+def insert_suffix(filename, suffix):
+    # Insert a marker before the FASTQ extension, e.g. "R1.fastq.gz" -> "R1.seed3.fastq.gz".
     for ext in sorted(valid_fastq_extensions, key=len, reverse=True):
         if filename.endswith(ext):
-            return f"{filename[:-len(ext)]}.seed{seed}{ext}"
-    return f"{filename}.seed{seed}"
+            return f"{filename[:-len(ext)]}.{suffix}{ext}"
+    return f"{filename}.{suffix}"
+
+def insert_seed_suffix(filename, seed):
+    # Per-seed marker, so that distinct seeds write to distinct output files instead of overwriting one another.
+    return insert_suffix(filename, f"seed{seed}")
 
 def resolve_output_path(file, output_directory, gzip_output, multiple_seeds, seed):
     # Build the per-file output path, disambiguating by seed when needed and forcing the
@@ -228,7 +305,7 @@ def resolve_output_path(file, output_directory, gzip_output, multiple_seeds, see
         output_path = output_path[:-3]
     return output_path
 
-def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, multiple_seeds, rng, verbose):
+def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose):
     # Lazily yield (callable, kwargs) write jobs for one seed. Each group's occurrence list is built
     # HERE, in the parent process, so the shared `rng` is consumed in exactly the same order as the
     # single-process path; only the I/O-bound write_fastq call is handed off as a job. This keeps the
@@ -244,9 +321,10 @@ def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacem
 
         for member in files_total:
             output_path = resolve_output_path(member, output, gzip_output, multiple_seeds, seed)
-            yield write_fastq, dict(input_fastq=member, output_path=output_path, occurrence_list=occurrence_list, total_reads=total_reads, gzip_output=gzip_output, seed=seed, unique_headers=unique_headers, verbose=verbose)
+            oob_path = insert_suffix(output_path, "oob") if oob else None
+            yield write_fastq, dict(input_fastq=member, output_path=output_path, occurrence_list=occurrence_list, total_reads=total_reads, gzip_output=gzip_output, seed=seed, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob_path=oob_path, verbose=verbose)
 
-def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, unique_headers = False, multiple_seeds = False, verbose=True):
+def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, unique_headers = False, collapse_duplicates = False, oob = False, multiple_seeds = False, verbose=True):
     # One-pass counterpart of bootstrap_single_file. No occurrence vector is materialized and the
     # file length is never counted; every member of the group is written from the same child_seed
     # so their sampled multiplicities match read-for-read, keeping mate pairs synchronized.
@@ -255,8 +333,9 @@ def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_o
 
     for file in files_total:
         output_path = resolve_output_path(file, output_directory, gzip_output, multiple_seeds, seed)
+        oob_path = insert_suffix(output_path, "oob") if oob else None
 
-        write_fastq_one_pass(input_fastq = file, output_path = output_path, fraction = fraction, replacement = replacement, child_seed = child_seed, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, verbose = verbose)
+        write_fastq_one_pass(input_fastq = file, output_path = output_path, fraction = fraction, replacement = replacement, child_seed = child_seed, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, collapse_duplicates = collapse_duplicates, oob_path = oob_path, verbose = verbose)
 
 def run_write_jobs(jobs, max_workers):
     # Execute (callable, kwargs) write jobs. The write stage is dominated by I/O (read, optional
@@ -280,7 +359,7 @@ def run_write_jobs(jobs, max_workers):
         for future in in_flight:
             future.result()
 
-def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, unique_headers, one_pass, verbose):
+def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, unique_headers, one_pass, verbose, collapse_duplicates=False, oob=False):
     multiple_seeds = len(seed_list) > 1
     cpu_count = os.cpu_count() or 1
     # Number of individual output files (groups expanded); this is the most write jobs that can run
@@ -296,7 +375,7 @@ def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, r
             child_seeds = np.random.SeedSequence(seed).spawn(len(file_list))
             jobs = (
                 (bootstrap_single_file_one_pass,
-                 dict(files_total=file, child_seed=child_seed, gzip_output=gzip_output, output_directory=output, seed=seed, fraction=fraction, replacement=replacement, unique_headers=unique_headers, multiple_seeds=multiple_seeds, verbose=verbose))
+                 dict(files_total=file, child_seed=child_seed, gzip_output=gzip_output, output_directory=output, seed=seed, fraction=fraction, replacement=replacement, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob=oob, multiple_seeds=multiple_seeds, verbose=verbose))
                 for file, child_seed in zip(file_list, child_seeds)
             )
             max_workers = min(len(file_list), cpu_count)
@@ -309,7 +388,7 @@ def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, r
             # scheduled across processes.
             random.seed(seed)
             rng = np.random.default_rng(seed)
-            jobs = two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, multiple_seeds, rng, verbose)
+            jobs = two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose)
             max_workers = min(num_individual_files, cpu_count)
 
         run_write_jobs(jobs, max_workers=max_workers)
@@ -349,6 +428,8 @@ def fastQpick(
     low_memory: bool = False,
     unique_headers: Union[bool, None] = None,
     one_pass: bool = False,
+    collapse_duplicates: bool = False,
+    oob: bool = False,
     verbose: bool = True,
     **kwargs
 ):
@@ -369,6 +450,8 @@ def fastQpick(
     low_memory (bool)                       Activate low memory mode. Disabled if one_pass is True.
     unique_headers (bool)                   Add a unique identifier to the header names of the output files. Default False if without_replacement is True, True if without_replacement is False.
     one_pass (bool)                         Use the single-pass approximate sampler. Uses low memory and runs faster in some cases (when the fraction is small or the input is large compared to available memory).
+    collapse_duplicates (bool)              Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Reduces output size when sampling with replacement. Overrides unique_headers.
+    oob (bool)                              Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file for each output file.
     verbose (bool)                          Whether to print progress information.
 
     kwargs
@@ -447,9 +530,11 @@ def fastQpick(
     if file_group_size > 1:
         input_files_parsed = group_items(input_files_parsed, group_size=file_group_size)
     
+    if collapse_duplicates:
+        unique_headers = False  # each read is written once, so its header is already unique
     if unique_headers is None:
         unique_headers = replacement  # default to True if replacement is True, False if replacement is False
-    if replacement and not unique_headers:
+    if replacement and not unique_headers and not collapse_duplicates:
         logger.warning(f"unique_headers is {unique_headers} but replacement is {replacement}. This may lead to duplicate header names in the output files, which can cause issues for downstream tools. Consider setting unique_headers to {replacement} to match the replacement setting.")
     if not replacement and unique_headers:
         logger.warning(f"unique_headers is {unique_headers} but replacement is {replacement}. This may lead to unnecessarily verbose header names in the output files. Consider setting unique_headers to {replacement} to match the replacement setting.")
@@ -460,7 +545,7 @@ def fastQpick(
         make_fastq_to_length_dict(input_files_parsed, verbose=verbose)
 
     # Do the sampling
-    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seeds, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, unique_headers=unique_headers, one_pass=one_pass, verbose=verbose)
+    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seeds, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, unique_headers=unique_headers, one_pass=one_pass, verbose=verbose, collapse_duplicates=collapse_duplicates, oob=oob)
 
 def main():
     # Create argument parser
@@ -476,6 +561,8 @@ def main():
     parser.add_argument("-l", "--low-memory", action="store_true", help="Activate low memory mode. Disabled if one_pass is True.")
     parser.add_argument("-u", "--unique-headers", action="store_true", default=None, help="Add a unique identifier to the header names of the output files. Defaults to True when sampling with replacement, False otherwise.")
     parser.add_argument("-p", "--one_pass", action="store_true", help="Use the single-pass approximate sampler. Uses low memory and runs faster in some cases (when the fraction is small or the input is large compared to available memory).")
+    parser.add_argument("-c", "--collapse-duplicates", action="store_true", help='Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Overrides --unique-headers.')
+    parser.add_argument("--oob", action="store_true", help='Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file.')
     parser.add_argument("-q", "--quiet", action="store_false", help="Whether to print progress information.")
     parser.add_argument("-v", "--version", action="version", version=f"fastQpick {__version__}", help="Show program's version number and exit")
 
@@ -497,4 +584,6 @@ def main():
               low_memory=args.low_memory,
               unique_headers=args.unique_headers,
               one_pass=args.one_pass,
+              collapse_duplicates=args.collapse_duplicates,
+              oob=args.oob,
               verbose=args.quiet)

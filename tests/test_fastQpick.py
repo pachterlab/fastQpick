@@ -323,6 +323,70 @@ def validate_fastq_format(file_path, ground_truth=None):
             assert plus_line == ground_truth[header]["plus_line"], f"Plus line mismatch - expected: {plus_line}; got: {ground_truth[header]['plus_line']}"
             assert qual == ground_truth[header]["quality"], f"Quality mismatch - expected: {qual}; got: {ground_truth[header]['quality']}"
 
+def read_headers(file_path):
+    return [header for header, _, _, _ in read_fastq(file_path, include_plus_line=True)]
+
+
+@pytest.mark.parametrize("mode", [dict(), dict(low_memory=True), dict(one_pass=True)])
+def test_collapse_duplicates_matches_expanded_output(temp_large_fastq_file, mode):
+    # The collapsed output must encode exactly the same multiset of reads as the ordinary output
+    # for the same seed: each sampled read once, with its multiplicity in a ";size=<count>" tag.
+    base = os.path.basename(temp_large_fastq_file)
+    with tempfile.TemporaryDirectory() as dir_expanded, tempfile.TemporaryDirectory() as dir_collapsed:
+        common = dict(input_files=temp_large_fastq_file, fraction=1.0, seed=7, overwrite=True, verbose=False, disable_gzip=True, **mode)
+        fastQpick(output_dir=dir_expanded, unique_headers=False, **common)
+        fastQpick(output_dir=dir_collapsed, collapse_duplicates=True, **common)
+
+        expanded_counts = {}
+        for header in read_headers(os.path.join(dir_expanded, base)):
+            expanded_counts[header] = expanded_counts.get(header, 0) + 1
+
+        collapsed_counts = {}
+        for header in read_headers(os.path.join(dir_collapsed, base)):
+            name, size = header.rsplit(";size=", 1)
+            assert name not in collapsed_counts, "a collapsed read must be written only once"
+            collapsed_counts[name] = int(size)
+
+        assert collapsed_counts == expanded_counts
+        assert max(collapsed_counts.values()) > 1, "a full-size bootstrap should contain duplicated reads"
+
+
+@pytest.mark.parametrize("mode", [dict(), dict(low_memory=True), dict(one_pass=True)])
+@pytest.mark.parametrize("without_replacement,fraction", [(False, 1.0), (True, 0.3)])
+def test_oob_is_complement_of_sample(temp_large_fastq_file, mode, without_replacement, fraction):
+    # The out-of-bag file must contain exactly the input reads that are absent from the sample.
+    base = os.path.basename(temp_large_fastq_file)
+    with tempfile.TemporaryDirectory() as temp_output_dir:
+        fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=11, output_dir=temp_output_dir,
+                  without_replacement=without_replacement, unique_headers=False, oob=True, overwrite=True,
+                  verbose=False, disable_gzip=True, **mode)
+        oob_file = os.path.join(temp_output_dir, base.replace(".fastq", ".oob.fastq"))
+        validate_fastq_format(oob_file, ground_truth=make_fastq_dict(temp_large_fastq_file))
+
+        sampled = set(read_headers(os.path.join(temp_output_dir, base)))
+        oob_headers = read_headers(oob_file)
+        all_headers = set(read_headers(temp_large_fastq_file))
+
+        assert len(oob_headers) == len(set(oob_headers)), "out-of-bag reads must be written once"
+        assert sampled.isdisjoint(oob_headers)
+        assert sampled | set(oob_headers) == all_headers
+        if not without_replacement:
+            # a full-size bootstrap leaves ~1/e of the reads out of bag
+            assert abs(len(oob_headers) / len(all_headers) - 0.3679) < 0.02
+
+
+def test_oob_pairwise_agreement(temp_large_paired_fastq_files):
+    # Out-of-bag files of grouped inputs must stay synchronized, like the samples themselves.
+    with tempfile.TemporaryDirectory() as temp_output_dir:
+        fastQpick(input_files=temp_large_paired_fastq_files, fraction=1.0, seed=3, output_dir=temp_output_dir,
+                  file_group_size=2, oob=True, collapse_duplicates=True, overwrite=True, verbose=False, disable_gzip=True)
+        outputs = [os.path.join(temp_output_dir, os.path.basename(f)) for f in temp_large_paired_fastq_files]
+        for suffix in (".fastq", ".oob.fastq"):
+            headers_1 = read_headers(outputs[0].replace(".fastq", suffix))
+            headers_2 = read_headers(outputs[1].replace(".fastq", suffix))
+            assert [h.replace("_1", "", 1) for h in headers_1] == [h.replace("_2", "", 1) for h in headers_2]
+
+
 def count_number_of_unique_headers(file_path):
     headers = set()
     for header, _, _, _ in read_fastq(file_path, include_plus_line=True):

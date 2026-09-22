@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastQpick"
-version = "0.3.0"
+version = "0.4.0"
 description = "Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement."
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {file = "LICENSE"}
