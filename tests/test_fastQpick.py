@@ -600,3 +600,177 @@ def test_paired_files_bootstrapped(temp_paired_fastq_files):
         check_pairwise_agreement(temp_paired_fastq_files=temp_paired_fastq_files, temp_output_dir=temp_output_dir, gzip_output=gzip_output)
 
         # st()
+
+# --- streaming input (reading the library from a pipe) ------------------------------
+
+def _records_bytes(n, rl=4):
+    return b"".join(f"@r{i} desc\n{'ACGT' * rl}\n+\n{'I' * (4 * rl)}\n".encode() for i in range(n))
+
+
+@pytest.mark.parametrize("chunk_size", [1 << 22, 64, 7])
+def test_stream_fastq_records_keeps_final_record(chunk_size):
+    # Regression test for the reason this reader exists: pyfastx.Fastx silently drops the
+    # last record when its input is a pipe. Small chunk sizes exercise the carry logic that
+    # splices records straddling a chunk boundary.
+    import io
+    from fastQpick.main import stream_fastq_records
+
+    raw = _records_bytes(500)
+    records = list(stream_fastq_records(io.BytesIO(raw), chunk_size=chunk_size))
+    assert len(records) == 500
+    assert records[0] == ("r0 desc", "ACGTACGTACGTACGT", "I" * 16)
+    assert records[-1] == ("r499 desc", "ACGTACGTACGTACGT", "I" * 16)
+
+
+def test_stream_fastq_records_without_trailing_newline():
+    import io
+    from fastQpick.main import stream_fastq_records
+
+    raw = _records_bytes(10).rstrip(b"\n")
+    assert len(list(stream_fastq_records(io.BytesIO(raw)))) == 10
+
+
+def test_stream_fastq_records_rejects_truncated_record():
+    import io
+    from fastQpick.main import stream_fastq_records
+
+    raw = _records_bytes(10) + b"@r10 desc\nACGT\n"
+    with pytest.raises(ValueError, match="Truncated FASTQ record"):
+        list(stream_fastq_records(io.BytesIO(raw)))
+
+
+def test_stream_fastq_records_reads_gzip_stream():
+    import gzip as _gzip
+    import io
+    from fastQpick.main import stream_fastq_records
+
+    raw = _gzip.compress(_records_bytes(300))
+    assert len(list(stream_fastq_records(io.BytesIO(raw)))) == 300
+
+
+@pytest.mark.parametrize("compress_stdin", [False, True])
+def test_stdin_matches_file_input(tmp_path, temp_large_fastq_file, compress_stdin):
+    # A library piped in must produce exactly the output the same library on disk produces.
+    import gzip as _gzip
+    import shutil
+    import subprocess
+
+    exe = shutil.which("fastQpick")
+    if exe is None:
+        pytest.skip("fastQpick console script is not on PATH")
+
+    from_file = tmp_path / "from_file"
+    from_pipe = tmp_path / "from_pipe"
+    common = ["-f", "1", "-s", "42", "-p", "-z", "-w", "-q", "-o"]
+
+    subprocess.run([exe, *common, str(from_file), temp_large_fastq_file], check=True)
+
+    payload = open(temp_large_fastq_file, "rb").read()
+    if compress_stdin:
+        payload = _gzip.compress(payload)
+    subprocess.run([exe, *common, str(from_pipe), "-"], input=payload, check=True)
+
+    expected = (from_file / os.path.basename(temp_large_fastq_file)).read_bytes()
+    assert (from_pipe / "stdin.fastq").read_bytes() == expected
+
+
+def test_stdin_requires_one_pass(tmp_path, temp_large_fastq_file):
+    # The two-pass modes need to read the library twice, which a stream cannot do.
+    with pytest.raises(ValueError, match="requires one_pass"):
+        fastQpick(input_files="-", fraction=1.0, seed=42, output_dir=str(tmp_path / "out"),
+                  one_pass=False, disable_gzip=True, overwrite=True, verbose=False)
+
+
+def test_stdin_rejects_additional_inputs(tmp_path, temp_large_fastq_file):
+    with pytest.raises(ValueError, match="cannot be combined with other input files"):
+        fastQpick(input_files=["-", temp_large_fastq_file], fraction=1.0, seed=42,
+                  output_dir=str(tmp_path / "out"), one_pass=True, disable_gzip=True,
+                  overwrite=True, verbose=False)
+
+
+def test_gzip_output_round_trips(tmp_path, temp_large_fastq_file):
+    # The output writer uses multithreaded ISA-L deflate when available; the bytes it emits
+    # must still be ordinary gzip that any reader can open.
+    import gzip as _gzip
+
+    gz_dir = tmp_path / "gz"
+    plain_dir = tmp_path / "plain"
+    for out, disable in ((gz_dir, False), (plain_dir, True)):
+        fastQpick(input_files=temp_large_fastq_file, fraction=1.0, seed=42, output_dir=str(out),
+                  one_pass=True, disable_gzip=disable, overwrite=True, verbose=False)
+
+    base = os.path.basename(temp_large_fastq_file)
+    assert _gzip.open(gz_dir / f"{base}.gz", "rt").read() == (plain_dir / base).read_text()
+
+
+# --- user-supplied read counts (skipping the counting pass) --------------------------
+
+@pytest.fixture
+def fresh_length_dict(monkeypatch):
+    # fastq_to_length_dict is a module global that caches counts across calls; isolate each test.
+    import fastQpick.main as main_module
+    monkeypatch.setattr(main_module, "fastq_to_length_dict", {})
+    return main_module
+
+
+@pytest.mark.parametrize("read_counts", [20000, [20000], "dict"])
+def test_read_counts_skips_counting_and_matches(tmp_path, temp_large_fastq_file, fresh_length_dict, monkeypatch, read_counts):
+    common = dict(input_files=temp_large_fastq_file, fraction=1.0, seed=42, disable_gzip=True, overwrite=True, verbose=False)
+    fastQpick(output_dir=str(tmp_path / "counted"), **common)
+
+    fresh_length_dict.fastq_to_length_dict.clear()
+    def fail(*args, **kwargs):
+        raise AssertionError("count_reads must not run when read_counts is given")
+    monkeypatch.setattr(fresh_length_dict, "count_reads", fail)
+    if read_counts == "dict":
+        read_counts = {temp_large_fastq_file: 20000}
+    fastQpick(output_dir=str(tmp_path / "given"), read_counts=read_counts, **common)
+
+    base = os.path.basename(temp_large_fastq_file)
+    assert (tmp_path / "given" / base).read_bytes() == (tmp_path / "counted" / base).read_bytes()
+
+
+@pytest.mark.parametrize("wrong_count", [19999, 20001])
+@pytest.mark.parametrize("fraction, low_memory, oob", [(1.0, False, False), (1.0, True, False), (1.0, False, True), (0.001, False, False)])
+def test_wrong_read_count_raises(tmp_path, temp_large_fastq_file, fresh_length_dict, wrong_count, fraction, low_memory, oob):
+    # Covers the dense-array and Counter (fraction=0.001) occurrence lists and the tagged writer (oob).
+    with pytest.raises(ValueError, match="read count used for sampling"):
+        fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=42, output_dir=str(tmp_path / "out"),
+                  low_memory=low_memory, oob=oob, read_counts=wrong_count, disable_gzip=True, overwrite=True, verbose=False)
+
+
+@pytest.mark.parametrize("read_counts", [[20000], [20000, 20000]])
+def test_read_counts_per_group_or_per_file(tmp_path, temp_large_paired_fastq_files, fresh_length_dict, read_counts):
+    fastQpick(input_files=temp_large_paired_fastq_files, fraction=1.0, seed=42, output_dir=str(tmp_path / "out"),
+              file_group_size=2, read_counts=read_counts, unique_headers=False, disable_gzip=True, overwrite=True, verbose=False)
+    check_pairwise_agreement(temp_paired_fastq_files=temp_large_paired_fastq_files, temp_output_dir=str(tmp_path / "out"), gzip_output=False)
+
+
+@pytest.mark.parametrize("read_counts, message", [
+    ([20000, 19999], "differ"),
+    ([20000, 20000, 20000], "one count per file or one per group"),
+    ([-1], "non-negative integer"),
+])
+def test_invalid_read_counts_rejected(tmp_path, temp_large_paired_fastq_files, fresh_length_dict, read_counts, message):
+    with pytest.raises(ValueError, match=message):
+        fastQpick(input_files=temp_large_paired_fastq_files, fraction=1.0, seed=42, output_dir=str(tmp_path / "out"),
+                  file_group_size=2, read_counts=read_counts, disable_gzip=True, overwrite=True, verbose=False)
+
+
+def test_read_counts_cli(tmp_path, temp_large_paired_fastq_files):
+    import shutil
+    import subprocess
+
+    exe = shutil.which("fastQpick")
+    if exe is None:
+        pytest.skip("fastQpick console script is not on PATH")
+
+    common = ["-f", "1", "-s", "42", "-g", "2", "-z", "-w", "-q"]
+    subprocess.run([exe, *common, "-o", str(tmp_path / "counted"), *temp_large_paired_fastq_files], check=True)
+    subprocess.run([exe, *common, "--read-counts", "20000,20000", "-o", str(tmp_path / "given"), *temp_large_paired_fastq_files], check=True)
+    for path in temp_large_paired_fastq_files:
+        base = os.path.basename(path)
+        assert (tmp_path / "given" / base).read_bytes() == (tmp_path / "counted" / base).read_bytes()
+
+    wrong = subprocess.run([exe, *common, "--read-counts", "123", "-o", str(tmp_path / "wrong"), *temp_large_paired_fastq_files], capture_output=True, text=True)
+    assert wrong.returncode != 0 and "read count used for sampling" in wrong.stderr

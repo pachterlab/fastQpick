@@ -66,18 +66,45 @@ Write each sampled read once, with its multiplicity recorded in the header as `;
 fastQpick -f 1 --collapse-duplicates sample.fastq.gz
 ```
 
+The default and low-memory modes first read each file once to count its reads. If the counts are already known (e.g., from a QC report), pass them with `--read-counts`, comma-separated in input order, one per file or one per group with `-g`. fastQpick checks each count during the writing pass and stops with an error if it does not match the file:
+```bash
+fastQpick -f 1 -g 2 --read-counts 5725730 sample_R1.fastq.gz sample_R2.fastq.gz
+```
+
 ### Choosing a sampling mode
 
-| Mode | Flag | Output size | Peak memory (500M reads, `-f 1`) | When to use |
-|---|---|---|---|---|
-| Default | (none) | exact | ~9.4 GB (~20 bytes/read) | The machine has enough memory. Fastest exact mode. |
-| Low-memory | `-l` / `--low-memory` | exact | ~1.4 GB (~3 bytes/read) | Memory is limiting and an exact number of output reads is required. |
-| Single-pass | `-p` / `--one_pass` | exact in expectation | ~0.1 GB (constant) | Memory is limiting and speed or minimal memory matters more than an exact output size (relative standard deviation `1/sqrt(fraction * n)`). |
+| Mode | Flag | Output size | Peak memory (500M reads, `-f 1`) | Reads a pipe | When to use |
+|---|---|---|---|---|---|
+| Default | (none) | exact | ~9.4 GB (~20 bytes/read) | no | The machine has enough memory. Fastest exact mode. |
+| Low-memory | `-l` / `--low-memory` | exact | ~1.5 GB (~3 bytes/read) | no | Memory is limiting and an exact number of output reads is required. |
+| Single-pass | `-p` / `--one_pass` | exact in expectation | ~0.1 GB (constant) | yes | The input is a stream, or it is gzipped and you would rather not decompress it twice, or minimal memory matters more than an exact output size (relative standard deviation `1/sqrt(fraction * n)`). |
 
 ```bash
 fastQpick -f 1 --low-memory sample.fastq.gz   # exact, low peak memory
 fastQpick -f 1 --one_pass sample.fastq.gz     # approximate size, constant memory, one pass
 ```
+
+### Streaming from a pipe
+
+The default and low-memory modes read the library twice, once to count the reads and once to
+write the sample, so they need a file they can re-open. The single-pass sampler never needs the
+read count, so it can take the library on standard input as `-`:
+
+```bash
+zcat sample.fastq.gz | fastQpick -f 1 --one_pass -o out -    # from a pipe
+fastq-dump --stdout SRR000001 | fastQpick -f 0.1 --one_pass -dr -o out -
+```
+
+The output is written to `out/stdin.fastq[.gz]`. A gzipped stream is detected and decompressed
+automatically, so `cat sample.fastq.gz |` works as well as `zcat sample.fastq.gz |`.
+
+Streaming is only available with `--one_pass`, only for a single input, and cannot be combined
+with file grouping (`-g`), since each member of a group needs its own stream. fastQpick reports
+an error rather than sampling incorrectly if any of these is violated.
+
+On a gzipped library this is also the cheaper mode even when memory is plentiful: the two-pass
+modes decompress the whole file twice, which on a 500-million-read library costs about ten
+minutes of CPU per extra pass.
 
 ### Python API
 
@@ -103,10 +130,11 @@ fastQpick(
 )
 
 # Skip the counting pass when the number of reads is already known
+# (one count per file or per group, in input order, or a dict {path: count})
 fastQpick(
     input_files="sample.fastq.gz",
     fraction=1.0,
-    fastq_to_length_dict={"sample.fastq.gz": 5725730},
+    read_counts=5725730,
 )
 ```
 
@@ -144,42 +172,14 @@ Two Jupyter notebooks in [`notebooks/`](notebooks/) walk through `fastQpick` end
 - **[`intro.ipynb`](notebooks/intro.ipynb)** — Getting started on synthetic data. Simulates a small RNA-seq experiment with known transcript abundances, draws bootstrap replicates with replacement (`fraction=1.0`, `replacement=True`), and shows that the bootstrap standard errors recover the analytic multinomial sampling error.
 - **[`yeast_example.ipynb`](notebooks/yeast_example.ipynb)** — Real-data application reproducing Figure 1 of the paper. Bootstraps a paired-end yeast RNA-seq dataset (SRA `SRR453566`), re-quantifies each replicate with `kallisto`, and characterizes the bootstrap distribution of the transcript abundance estimates.
 
-To reproduce the figures exactly as they appear in the manuscript, check out the `manuscript` tag before running the notebooks:
-```bash
-git checkout manuscript
-```
-
 ---
 
 ## Features
 
-- Time efficient - streams through the fastq and writes output in batches - generates a full-size (fraction=1, with replacement) bootstrap replicate of a 500M-read FASTQ in ~26 minutes in standard mode, ~56 minutes in low-memory mode, and ~35 minutes in one-pass mode (see [Benchmark](#benchmark) below).
+- Time efficient - streams through the fastq and writes output in batches - generates a full-size (fraction=1, with replacement) bootstrap replicate of a 500M-read FASTQ in ~30 minutes in standard mode, ~35 minutes in low-memory mode, and ~33 minutes in one-pass mode (see [Benchmark](#benchmark) below).
 - Memory efficient - the occurrence vector is sized to the largest per-read count actually drawn (one byte per read in the common case), and low-memory mode further avoids materializing the array of sampled indices.
 - Optional out-of-bag output (`--oob`) and multiplicity-tagged, duplicate-free output (`--collapse-duplicates`).
 - Gzip-compressed output by default, using the ISA-L-accelerated [`isal`](https://github.com/pycompression/python-isal) library to keep compression from bottlenecking the write pass. Pass `--disable-gzip` (CLI) or `disable_gzip=True` (Python API) to write plain FASTQ instead.
-
----
-
-## Benchmark
-
-Benchmarks were run on a 500-million-read FASTQ file (143 GB uncompressed) with plain-text output, on a server with two Intel Xeon Gold 6152 CPUs (2.10 GHz, 44 cores / 88 threads in total), 754 GB of RAM, and a 12 TB 7200 rpm hard disk drive (HGST Ultrastar, ext4), running CentOS Stream 8 with Python 3.10. fastQpick uses a single process per output file. Each run started from a cold page cache.
-
-| Mode | Runtime | Peak memory | Output size |
-|---|---|---|---|
-| Default | 26 min | 9.4 GB | exact |
-| Low-memory (`-l`) | 56 min | 1.4 GB | exact |
-| Single-pass (`-p`) | 35 min | 0.11 GB | exact in expectation |
-
-Comparison with other subsampling tools on a 20% subsample without replacement (m = 100M reads) of the same file, each tool with its default thread count. "Cold" runs started with the input evicted from the page cache, "warm" runs with the input resident in the page cache. seqtk and seqkit sample each read with probability 0.2, so their output size (like that of fastQpick's single-pass mode) is exact in expectation. fastp has no random subsampling: `--reads_to_process` keeps the first m reads and stops reading, so it processes only 20% of the input. None of the three tools samples with replacement.
-
-| Tool | Cold | Warm | Peak memory | Output reads |
-|---|---|---|---|---|
-| seqtk 1.5 (`sample -s 42 0.2`) | 16.8 min | 4.1 min | 3 MB | 99,979,934 |
-| seqkit 2.13 (`sample -p 0.2`) | 17.9 min | 3.5 min | 35 MB | 100,009,778 |
-| fastp 1.3 (`--reads_to_process`, first m reads) | 3.6 min | 2.0 min | 1.1 GB | 100,000,000 |
-| fastQpick default | 23.1 min | 8.5 min | 5.2 GB | 100,000,000 |
-| fastQpick low-memory (`-l`) | -- | 8.5 min | 0.56 GB | 100,000,000 |
-| fastQpick single-pass (`-p`) | 17.6 min | 5.2 min | 67 MB | 99,995,639 |
 
 ---
 
@@ -193,3 +193,13 @@ fastQpick is licensed under the 2-clause BSD license. See the [LICENSE](LICENSE)
 
 We welcome contributions! Please see the [CONTRIBUTING.md](CONTRIBUTING.md) file for guidelines on how to get involved.
 
+---
+
+## Manuscript
+
+Read the manuscript describing fastQpick in the [bioRxiv preprint](https://www.biorxiv.org/content/10.64898/2026.06.23.734068v1) (DOI: 10.64898/2026.06.23.734068).
+
+To reproduce the figures exactly as they appear in the manuscript, check out the `manuscript` tag before running the notebooks (fastQpick v1.0.0):
+```bash
+git checkout manuscript
+```

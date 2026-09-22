@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastQpick"
-version = "0.4.0"
+version = "1.0.0"
 description = "Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement."
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {file = "LICENSE"}
@@ -42,9 +42,11 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["fastQpick"]
+py-modules = ["fastqpick"]  # lowercase import alias
 
 [tool.setuptools.package-data]
 fastQpick = ["*.txt", "*.md", "*.csv"]  # Ensure additional files like data or docs are included
 
 [project.scripts]
 fastQpick = "fastQpick.main:main"  # This replaces the console_scripts entry
+fastqpick = "fastQpick.main:main"  # lowercase alias
