@@ -12,6 +12,14 @@ def count_reads(filepath):
     num_reads = sum(1 for _ in fastq_file)
     return num_reads
 
+def available_cpus():
+    # Cores this process may run on. os.cpu_count() reports every core on the machine, which on a
+    # shared cluster node can far exceed the job's allocation; the affinity mask respects it.
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # not available on macOS or Windows
+        return os.cpu_count() or 1
+
 def _parse_seed_token(token):
     """Expand a single seed token into a list of integers.
 

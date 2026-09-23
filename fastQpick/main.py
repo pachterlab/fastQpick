@@ -15,7 +15,7 @@ import pyfastx  # to loop through fastq (faster than custom python code)
 
 from fastQpick import logger
 from fastQpick._version import __version__
-from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, group_items, count_reads, parse_seed
+from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, group_items, count_reads, parse_seed, available_cpus
 
 try:
     from isal import igzip as gzip
@@ -37,16 +37,18 @@ except ImportError:
 valid_fastq_extensions = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
 batch_size = 200000  # for buffer
 fastq_to_length_dict = {}  # set to empty, and the user can provide otherwise it will be calculated
-gzip_output_threads = 4  # deflate threads when igzip_threaded is available
+gzip_output_threads = 4  # most deflate threads per output file when igzip_threaded is available
+default_threads = 4  # total thread budget when the caller does not set one
 STDIN_SENTINEL = "-"  # read the library from standard input instead of from a file
 
-def open_output(path, gzip_output):
-    # Text-mode output handle using the fastest gzip writer available.
+def open_output(path, gzip_output, gzip_threads=gzip_output_threads):
+    # Text-mode output handle using the fastest gzip writer available. gzip_threads is the number of
+    # background deflate threads; 0 compresses in the calling thread.
     if not gzip_output:
         return open(path, "w")
     if igzip_threaded is not None:
         return igzip_threaded.open(path, "wt", compresslevel=gzip_compresslevel,
-                                   threads=gzip_output_threads)
+                                   threads=gzip_threads)
     return gzip.open(path, "wt", compresslevel=gzip_compresslevel)
 
 def stream_fastq_records(fh, chunk_size=1 << 22):
@@ -134,8 +136,8 @@ def write_reads_tagged(read_count_pairs, f, f_oob, unique_headers, collapse_dupl
         f_oob.writelines(oob_buffer)
     return i + 1
 
-def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, unique_headers = False, collapse_duplicates = False, oob_path = None, verbose = True):
-    open_func = lambda path, mode=None: open_output(path, gzip_output)
+def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_output, seed = None, unique_headers = False, collapse_duplicates = False, oob_path = None, verbose = True, gzip_threads = gzip_output_threads):
+    open_func = lambda path, mode=None: open_output(path, gzip_output, gzip_threads)
     write_mode = None
     
     buffer = []  # Temporary storage for the batch
@@ -219,12 +221,12 @@ def occurrence_chunk_stream(rng, fraction, replacement, chunk_size):
         for count in chunk:
             yield count
 
-def write_fastq_one_pass(input_fastq, output_path, fraction, replacement, child_seed, gzip_output, seed=None, unique_headers=False, collapse_duplicates=False, oob_path=None, verbose=True):
+def write_fastq_one_pass(input_fastq, output_path, fraction, replacement, child_seed, gzip_output, seed=None, unique_headers=False, collapse_duplicates=False, oob_path=None, verbose=True, gzip_threads=gzip_output_threads):
     # Single-pass writer. A read's output multiplicity is drawn as the file streams by, so the read
     # count is never needed and peak memory is constant (only the flush buffer). All members of a
     # group are passed the same child_seed, so re-seeding here reproduces the identical multiplicity
     # sequence for every member and keeps mate pairs synchronized without a shared occurrence vector.
-    open_func = lambda path, mode=None: open_output(path, gzip_output)
+    open_func = lambda path, mode=None: open_output(path, gzip_output, gzip_threads)
     write_mode = None
 
     rng = np.random.default_rng(child_seed)
@@ -395,7 +397,7 @@ def resolve_output_path(file, output_directory, gzip_output, multiple_seeds, see
         output_path = output_path[:-3]
     return output_path
 
-def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose):
+def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_output_threads):
     # Lazily yield (callable, kwargs) write jobs for one seed. Each group's occurrence list is built
     # HERE, in the parent process, so the shared `rng` is consumed in exactly the same order as the
     # single-process path; only the I/O-bound write_fastq call is handed off as a job. This keeps the
@@ -412,9 +414,9 @@ def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacem
         for member in files_total:
             output_path = resolve_output_path(member, output, gzip_output, multiple_seeds, seed)
             oob_path = insert_suffix(output_path, "oob") if oob else None
-            yield write_fastq, dict(input_fastq=member, output_path=output_path, occurrence_list=occurrence_list, total_reads=total_reads, gzip_output=gzip_output, seed=seed, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob_path=oob_path, verbose=verbose)
+            yield write_fastq, dict(input_fastq=member, output_path=output_path, occurrence_list=occurrence_list, total_reads=total_reads, gzip_output=gzip_output, seed=seed, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob_path=oob_path, verbose=verbose, gzip_threads=gzip_threads)
 
-def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, unique_headers = False, collapse_duplicates = False, oob = False, multiple_seeds = False, verbose=True):
+def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, unique_headers = False, collapse_duplicates = False, oob = False, multiple_seeds = False, verbose=True, gzip_threads=gzip_output_threads):
     # One-pass counterpart of bootstrap_single_file. No occurrence vector is materialized and the
     # file length is never counted; every member of the group is written from the same child_seed
     # so their sampled multiplicities match read-for-read, keeping mate pairs synchronized.
@@ -425,7 +427,7 @@ def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_o
         output_path = resolve_output_path(file, output_directory, gzip_output, multiple_seeds, seed)
         oob_path = insert_suffix(output_path, "oob") if oob else None
 
-        write_fastq_one_pass(input_fastq = file, output_path = output_path, fraction = fraction, replacement = replacement, child_seed = child_seed, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, collapse_duplicates = collapse_duplicates, oob_path = oob_path, verbose = verbose)
+        write_fastq_one_pass(input_fastq = file, output_path = output_path, fraction = fraction, replacement = replacement, child_seed = child_seed, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, collapse_duplicates = collapse_duplicates, oob_path = oob_path, verbose = verbose, gzip_threads = gzip_threads)
 
 def run_write_jobs(jobs, max_workers):
     # Execute (callable, kwargs) write jobs. The write stage is dominated by I/O (read, optional
@@ -449,58 +451,96 @@ def run_write_jobs(jobs, max_workers):
         for future in in_flight:
             future.result()
 
-def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, unique_headers, one_pass, verbose, collapse_duplicates=False, oob=False):
-    multiple_seeds = len(seed_list) > 1
-    cpu_count = os.cpu_count() or 1
-    # Number of individual output files (groups expanded); this is the most write jobs that can run
-    # at once and so caps the worker count.
-    num_individual_files = sum(len(file) if isinstance(file, tuple) else 1 for file in file_list)
-    for seed in seed_list:
-        if one_pass:
-            # Derive one independent sub-seed per group from the master seed. Members of a group
-            # share their sub-seed (handled inside bootstrap_single_file_one_pass) so mates stay
-            # synchronized, while different groups draw independently, mirroring the two-pass path
-            # where each file consumes fresh random state. Each group is fully independent, so a whole
-            # group is one parallel write job.
-            child_seeds = np.random.SeedSequence(seed).spawn(len(file_list))
-            jobs = (
-                (bootstrap_single_file_one_pass,
-                 dict(files_total=file, child_seed=child_seed, gzip_output=gzip_output, output_directory=output, seed=seed, fraction=fraction, replacement=replacement, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob=oob, multiple_seeds=multiple_seeds, verbose=verbose))
-                for file, child_seed in zip(file_list, child_seeds)
-            )
-            max_workers = min(len(file_list), cpu_count)
-        else:
-            # Seed both RNGs once per seed: stdlib random drives the low-memory path, and a numpy
-            # Generator drives the default path. A single Generator is shared across the seed's files
-            # so that successive files draw independent samples while remaining reproducible. The
-            # occurrence lists are built serially in this process (inside two_pass_write_jobs), so the
-            # shared RNG is consumed in order and the output is independent of how the writes are
-            # scheduled across processes.
-            random.seed(seed)
-            rng = np.random.default_rng(seed)
-            jobs = two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose)
-            max_workers = min(num_individual_files, cpu_count)
+def resolve_threads(threads):
+    # An explicit thread count is honored as given. The default is a small fixed budget, as in most
+    # bioinformatics tools, so that an unconfigured run neither monopolizes a shared node nor varies
+    # with the machine; it is lowered on machines with fewer cores than that.
+    if threads is None:
+        return min(default_threads, available_cpus())
+    return threads
 
-        run_write_jobs(jobs, max_workers=max_workers)
-    
-def make_fastq_to_length_dict(file_list, verbose=True):
+def split_thread_budget(threads, num_jobs):
+    # Divide a total thread budget between parallel write jobs and the deflate threads inside each
+    # job. Each worker spends one thread on its record loop (which holds the GIL), and whatever is
+    # left of its share goes to background compression, up to gzip_output_threads. With a single job
+    # on a machine with 5+ cores this reproduces the previous behavior (one process, four deflate
+    # threads); with many jobs every thread becomes a worker and compression runs inline.
+    workers = max(1, min(num_jobs, threads))
+    gzip_threads = min(gzip_output_threads, threads // workers - 1)
+    return workers, gzip_threads
+
+def one_pass_jobs_all_seeds(file_list, seed_list, output, gzip_output, fraction, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, verbose, gzip_threads):
+    for seed in seed_list:
+        # Derive one independent sub-seed per group from the master seed. Members of a group share
+        # their sub-seed (handled inside bootstrap_single_file_one_pass) so mates stay synchronized,
+        # while different groups draw independently, mirroring the two-pass path where each file
+        # consumes fresh random state. Each (seed, group) pair is fully independent, so it is one
+        # parallel write job.
+        child_seeds = np.random.SeedSequence(seed).spawn(len(file_list))
+        for file, child_seed in zip(file_list, child_seeds):
+            yield bootstrap_single_file_one_pass, dict(files_total=file, child_seed=child_seed, gzip_output=gzip_output, output_directory=output, seed=seed, fraction=fraction, replacement=replacement, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob=oob, multiple_seeds=multiple_seeds, verbose=verbose, gzip_threads=gzip_threads)
+
+def two_pass_jobs_all_seeds(file_list, seed_list, fraction, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, verbose, gzip_threads):
+    for seed in seed_list:
+        # Seed both RNGs once per seed: stdlib random drives the low-memory Counter path, and a numpy
+        # Generator drives the other paths. A single Generator is shared across the seed's files so
+        # that successive files draw independent samples while remaining reproducible. This generator
+        # is consumed lazily in the parent, so a seed's RNGs are (re)seeded only after every
+        # occurrence list of the previous seed has been built; the RNG state each list sees is
+        # therefore the same as in a serial run, however the writes are scheduled across processes.
+        random.seed(seed)
+        rng = np.random.default_rng(seed)
+        yield from two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_threads)
+
+def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, unique_headers, one_pass, verbose, collapse_duplicates=False, oob=False, threads=None):
+    multiple_seeds = len(seed_list) > 1
+    threads = resolve_threads(threads)
+    # Jobs from every seed share one pool, so replicates of a single file run in parallel as well as
+    # distinct files. A job is a whole group in one-pass mode (its members re-derive the same
+    # multiplicities from a shared sub-seed) and an individual output file in two-pass mode (group
+    # members share an occurrence list built in the parent).
+    if one_pass:
+        num_jobs = len(file_list) * len(seed_list)
+    else:
+        num_individual_files = sum(len(file) if isinstance(file, tuple) else 1 for file in file_list)
+        num_jobs = num_individual_files * len(seed_list)
+    if STDIN_SENTINEL in file_list:
+        num_jobs = 1  # a single stream cannot be read by several workers at once
+    max_workers, gzip_threads = split_thread_budget(threads, num_jobs)
+
+    common = dict(file_list=file_list, seed_list=seed_list, output=output, gzip_output=gzip_output, fraction=fraction, replacement=replacement, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob=oob, multiple_seeds=multiple_seeds, verbose=verbose, gzip_threads=gzip_threads)
+    if one_pass:
+        jobs = one_pass_jobs_all_seeds(**common)
+    else:
+        jobs = two_pass_jobs_all_seeds(low_memory=low_memory, **common)
+    run_write_jobs(jobs, max_workers=max_workers)
+
+def make_fastq_to_length_dict(file_list, verbose=True, threads=None):
+    # Count the reads of every file (or of the first member of every group; members share its count)
+    # that does not already have a count. Counting is I/O- and decompression-bound and each file is
+    # independent, so with more than one file to count the files are counted in parallel.
     global fastq_to_length_dict
+    to_count = []  # (file counted, keys that receive its count)
     for file in file_list:
-        if isinstance(file, tuple):
-            if all(specific_file in fastq_to_length_dict for specific_file in file):
-                continue
-            if verbose:
-                logger.info(f"Counting {file[0]}")
-            count = count_reads(file[0])
-            for i in range(len(file)):
-                fastq_to_length_dict[file[i]] = count
-        elif isinstance(file, str):
-            if file in fastq_to_length_dict:
-                continue
-            if verbose:
-                logger.info(f"Counting {file}")
-            count = count_reads(file)
-            fastq_to_length_dict[file] = count
+        members = file if isinstance(file, tuple) else (file,)
+        if all(member in fastq_to_length_dict for member in members):
+            continue
+        to_count.append((members[0], members))
+
+    if to_count:
+        if verbose:
+            for counted, _ in to_count:
+                logger.info(f"Counting {counted}")
+        paths = [counted for counted, _ in to_count]
+        max_workers = min(len(paths), resolve_threads(threads))
+        if max_workers <= 1:
+            counts = [count_reads(path) for path in paths]
+        else:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                counts = list(executor.map(count_reads, paths))
+        for (_, members), count in zip(to_count, counts):
+            for member in members:
+                fastq_to_length_dict[member] = count
     if verbose:
         logger.info(f"fastq_to_length_dict: {fastq_to_length_dict}")
 
@@ -551,6 +591,7 @@ def fastQpick(
     collapse_duplicates: bool = False,
     oob: bool = False,
     read_counts: Union[int, list, dict, None] = None,
+    threads: Union[int, None] = None,
     verbose: bool = True,
     **kwargs
 ):
@@ -574,6 +615,7 @@ def fastQpick(
     collapse_duplicates (bool)              Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Reduces output size when sampling with replacement. Overrides unique_headers.
     oob (bool)                              Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file for each output file.
     read_counts (int, list, or dict)        Number of reads in each input file, to skip the counting pass of the two-pass modes. Either a dict mapping each file path to its read count, or an int / list of ints in input order (after directory expansion), with one count per file or one per group. Ignored when one_pass is True. The writing pass checks each count and raises an error if it does not match the file.
+    threads (int)                           Total number of threads (CPU cores) to use, shared between parallel file/replicate jobs and gzip compression. Defaults to 4, or to the number of available cores if fewer. Output does not depend on this value.
     verbose (bool)                          Whether to print progress information.
 
     kwargs
@@ -581,6 +623,9 @@ def fastQpick(
     fastq_to_length_dict (dict)             Dictionary of FASTQ file paths to number of reads in each file. If not provided, will be calculated.
     """
     replacement = not without_replacement
+    if threads is not None and threads < 1:
+        raise ValueError(f"threads must be a positive integer, got {threads}.")
+    threads = resolve_threads(threads)
     gzip_output = not disable_gzip  # output is gzip-compressed by default
 
     # check if fastq_to_length_dict is in kwargs
@@ -686,10 +731,10 @@ def fastQpick(
     elif read_counts is not None:
         apply_read_counts(read_counts, input_files_parsed)
     if not one_pass:
-        make_fastq_to_length_dict(input_files_parsed, verbose=verbose)
+        make_fastq_to_length_dict(input_files_parsed, verbose=verbose, threads=threads)
 
     # Do the sampling
-    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seeds, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, unique_headers=unique_headers, one_pass=one_pass, verbose=verbose, collapse_duplicates=collapse_duplicates, oob=oob)
+    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seeds, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, unique_headers=unique_headers, one_pass=one_pass, verbose=verbose, collapse_duplicates=collapse_duplicates, oob=oob, threads=threads)
 
 def parse_read_counts(value):
     # argparse type for --read-counts: a comma-separated list of integers. A single token is used
@@ -716,6 +761,7 @@ def main():
     parser.add_argument("-c", "--collapse-duplicates", action="store_true", help='Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Overrides --unique-headers.')
     parser.add_argument("--oob", action="store_true", help='Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file.')
     parser.add_argument("--read-counts", required=False, type=parse_read_counts, default=None, help="Comma-separated number of reads in each input file, in input order (one per file, or one per group with -g), e.g. --read-counts 5725730,5725730. Skips the counting pass. Ignored with --one_pass. An error is raised if a count does not match its file.")
+    parser.add_argument("-t", "--threads", required=False, type=int, default=None, help="Total number of threads to use, shared between parallel file/replicate jobs and gzip compression. Default: 4, or the number of available cores if fewer. Output does not depend on this value.")
     parser.add_argument("-q", "--quiet", action="store_false", help="Whether to print progress information.")
     parser.add_argument("-v", "--version", action="version", version=f"fastQpick {__version__}", help="Show program's version number and exit")
 
@@ -740,4 +786,5 @@ def main():
               collapse_duplicates=args.collapse_duplicates,
               oob=args.oob,
               read_counts=args.read_counts,
+              threads=args.threads,
               verbose=args.quiet)

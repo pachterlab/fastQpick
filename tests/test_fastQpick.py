@@ -774,3 +774,45 @@ def test_read_counts_cli(tmp_path, temp_large_paired_fastq_files):
 
     wrong = subprocess.run([exe, *common, "--read-counts", "123", "-o", str(tmp_path / "wrong"), *temp_large_paired_fastq_files], capture_output=True, text=True)
     assert wrong.returncode != 0 and "read count used for sampling" in wrong.stderr
+
+
+# --- threads (parallel counting, files, and replicates) --------------------------------
+
+def test_split_thread_budget():
+    from fastQpick.main import split_thread_budget
+    assert split_thread_budget(88, 1) == (1, 4)   # one job: all four deflate threads
+    assert split_thread_budget(8, 2) == (2, 3)    # 4 threads per worker: 1 record loop + 3 deflate
+    assert split_thread_budget(8, 8) == (8, 0)    # one thread per worker: compress inline
+    assert split_thread_budget(4, 100) == (4, 0)  # never more workers than threads
+    assert split_thread_budget(1, 1) == (1, 0)
+
+
+@pytest.mark.parametrize("mode", [dict(), dict(low_memory=True), dict(one_pass=True)])
+@pytest.mark.parametrize("disable_gzip", [True, False])
+def test_output_independent_of_threads(tmp_path, temp_large_paired_fastq_files, fresh_length_dict, mode, disable_gzip):
+    # Parallel counting, and writing several files and seeds at once, must not change the output.
+    import gzip as _gzip
+    outputs = {}
+    for threads in (1, 3, 8):
+        fresh_length_dict.fastq_to_length_dict.clear()
+        out_dir = tmp_path / f"t{threads}"
+        fastQpick(input_files=temp_large_paired_fastq_files, fraction=1.0, seed="1-3", file_group_size=2,
+                  output_dir=str(out_dir), threads=threads, disable_gzip=disable_gzip, overwrite=True, verbose=False, **mode)
+        opener = open if disable_gzip else _gzip.open
+        outputs[threads] = {name: opener(out_dir / name, "rb").read() for name in sorted(os.listdir(out_dir)) if ".fastq" in name}
+    assert len(outputs[1]) == 6  # 2 mates x 3 seeds
+    assert outputs[1] == outputs[3] == outputs[8]
+
+
+def test_resolve_threads(monkeypatch):
+    import fastQpick.main as main_module
+    monkeypatch.setattr(main_module, "available_cpus", lambda: 88)
+    assert main_module.resolve_threads(None) == 4
+    assert main_module.resolve_threads(16) == 16  # explicit values are not capped
+    monkeypatch.setattr(main_module, "available_cpus", lambda: 2)
+    assert main_module.resolve_threads(None) == 2
+
+
+def test_invalid_threads_rejected(tmp_path, temp_large_fastq_file):
+    with pytest.raises(ValueError, match="threads"):
+        fastQpick(input_files=temp_large_fastq_file, fraction=0.5, output_dir=str(tmp_path / "out"), threads=0, overwrite=True, verbose=False)

@@ -71,6 +71,12 @@ The default and low-memory modes first read each file once to count its reads. I
 fastQpick -f 1 -g 2 --read-counts 5725730 sample_R1.fastq.gz sample_R2.fastq.gz
 ```
 
+Read counting, separate files, and separate replicates (`-n`, or a seed range) run in parallel. `-t/--threads` sets the total number of threads, shared between parallel jobs and gzip compression. It defaults to 4 (or to the number of available cores, if fewer). The output does not depend on the thread count:
+
+```bash
+fastQpick -f 1 -n 20 -t 8 sample.fastq.gz
+```
+
 ### Choosing a sampling mode
 
 | Mode | Flag | Output size | Peak memory (500M reads, `-f 1`) | Reads a pipe | When to use |
