@@ -66,7 +66,7 @@ Write each sampled read once, with its multiplicity recorded in the header as `;
 fastQpick -f 1 --collapse-duplicates sample.fastq.gz
 ```
 
-The default and low-memory modes first read each file once to count its reads. If the counts are already known (e.g., from a QC report), pass them with `--read-counts`, comma-separated in input order, one per file or one per group with `-g`. fastQpick checks each count during the writing pass and stops with an error if it does not match the file:
+The default mode first reads each file once to count its reads. If the counts are already known (e.g., from a QC report), pass them with `--read-counts`, comma-separated in input order, one per file or one per group with `-g`. fastQpick checks each count during the writing pass and stops with an error if it does not match the file:
 ```bash
 fastQpick -f 1 -g 2 --read-counts 5725730 sample_R1.fastq.gz sample_R2.fastq.gz
 ```
@@ -81,30 +81,29 @@ fastQpick -f 1 -n 20 -t 8 sample.fastq.gz
 
 | Mode | Flag | Output size | Peak memory (500M reads, `-f 1`) | Reads a pipe | When to use |
 |---|---|---|---|---|---|
-| Default | (none) | exact | ~9.4 GB (~20 bytes/read) | no | The machine has enough memory. Fastest exact mode. |
-| Low-memory | `-l` / `--low-memory` | exact | ~1.5 GB (~3 bytes/read) | no | Memory is limiting and an exact number of output reads is required. |
-| Single-pass | `-p` / `--one_pass` | exact in expectation | ~0.1 GB (constant) | yes | The input is a stream, or it is gzipped and you would rather not decompress it twice, or minimal memory matters more than an exact output size (relative standard deviation `1/sqrt(fraction * n)`). |
+| Default | (none) | exact | ~0.6 GB (~1 byte/read) | no | An exact number of output reads is required, and the input is a file. |
+| Single-pass | `-p` / `--single-pass` | exact in expectation | ~0.1 GB (constant) | yes | The input is a stream, or it is gzipped and you would rather not decompress it twice, or minimal memory matters more than an exact output size (relative standard deviation `1/sqrt(fraction * n)`). |
 
 ```bash
-fastQpick -f 1 --low-memory sample.fastq.gz   # exact, low peak memory
-fastQpick -f 1 --one_pass sample.fastq.gz     # approximate size, constant memory, one pass
+fastQpick -f 1 sample.fastq.gz                  # exact size, two passes
+fastQpick -f 1 --single-pass sample.fastq.gz    # approximate size, constant memory, one pass
 ```
 
 ### Streaming from a pipe
 
-The default and low-memory modes read the library twice, once to count the reads and once to
-write the sample, so they need a file they can re-open. The single-pass sampler never needs the
+The default mode reads the library twice, once to count the reads and once to
+write the sample, so it needs a file they can re-open. The single-pass sampler never needs the
 read count, so it can take the library on standard input as `-`:
 
 ```bash
-zcat sample.fastq.gz | fastQpick -f 1 --one_pass -o out -    # from a pipe
-fastq-dump --stdout SRR000001 | fastQpick -f 0.1 --one_pass -dr -o out -
+zcat sample.fastq.gz | fastQpick -f 1 --single-pass -o out -    # from a pipe
+fastq-dump --stdout SRR000001 | fastQpick -f 0.1 --single-pass -dr -o out -
 ```
 
 The output is written to `out/stdin.fastq[.gz]`. A gzipped stream is detected and decompressed
 automatically, so `cat sample.fastq.gz |` works as well as `zcat sample.fastq.gz |`.
 
-Streaming is only available with `--one_pass`, only for a single input, and cannot be combined
+Streaming is only available with `--single-pass`, only for a single input, and cannot be combined
 with file grouping (`-g`), since each member of a group needs its own stream. fastQpick reports
 an error rather than sampling incorrectly if any of these is violated.
 
@@ -182,8 +181,8 @@ Two Jupyter notebooks in [`notebooks/`](notebooks/) walk through `fastQpick` end
 
 ## Features
 
-- Time efficient - streams through the fastq and writes output in batches - generates a full-size (fraction=1, with replacement) bootstrap replicate of a 500M-read FASTQ in ~30 minutes in standard mode, ~35 minutes in low-memory mode, and ~33 minutes in one-pass mode (see [Benchmark](#benchmark) below).
-- Memory efficient - the occurrence vector is sized to the largest per-read count actually drawn (one byte per read in the common case), and low-memory mode further avoids materializing the array of sampled indices.
+- Time efficient - streams through the fastq and writes output in batches - generates a full-size (fraction=1, with replacement) bootstrap replicate of a 500M-read FASTQ in ~30 minutes in standard mode and ~22 minutes in single-pass mode (see [Benchmark](#benchmark) below).
+- Memory efficient - the occurrence vector is sized to the largest per-read count actually drawn (one byte per read in the common case) and filled block by block, so neither the array of sampled indices nor a length-n counting temporary is ever materialized.
 - Optional out-of-bag output (`--oob`) and multiplicity-tagged, duplicate-free output (`--collapse-duplicates`).
 - Gzip-compressed output by default, using the ISA-L-accelerated [`isal`](https://github.com/pycompression/python-isal) library to keep compression from bottlenecking the write pass. Pass `--disable-gzip` (CLI) or `disable_gzip=True` (Python API) to write plain FASTQ instead.
 

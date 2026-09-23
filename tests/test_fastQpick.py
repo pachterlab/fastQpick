@@ -93,7 +93,7 @@ IIIIIIIIIIIIIIIIIIIII
 
 
 
-# A larger file is used for the one-pass tests so that the (random) output size concentrates
+# A larger file is used for the single-pass tests so that the (random) output size concentrates
 # tightly enough around its expectation for a loose statistical check to be stable.
 @pytest.fixture
 def temp_large_fastq_file():
@@ -124,14 +124,14 @@ def temp_large_paired_fastq_files():
     os.remove(temp_file2.name)
 
 
-def test_one_pass_bernoulli_without_replacement(temp_large_fastq_file):
-    # Without replacement the one-pass sampler keeps each read with probability `fraction`
+def test_single_pass_bernoulli_without_replacement(temp_large_fastq_file):
+    # Without replacement the single-pass sampler keeps each read with probability `fraction`
     # (a Bernoulli draw), so every output read is unique and the count is Binomial(n, fraction).
     fraction = 0.5
     n = count_reads(temp_large_fastq_file)
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=42,
-                  output_dir=temp_output_dir, without_replacement=True, one_pass=True, overwrite=True, verbose=False,
+                  output_dir=temp_output_dir, without_replacement=True, single_pass=True, overwrite=True, verbose=False,
                   disable_gzip=True)
         output_fastq_file = os.path.join(temp_output_dir, os.path.basename(temp_large_fastq_file))
 
@@ -148,7 +148,7 @@ def test_one_pass_bernoulli_without_replacement(temp_large_fastq_file):
         assert abs(num_out - mean) < 6 * std, f"output size {num_out} far from expected {mean:.0f}"
 
 
-def test_one_pass_poisson_with_replacement(temp_large_fastq_file):
+def test_single_pass_poisson_with_replacement(temp_large_fastq_file):
     # With replacement each read's multiplicity is Poisson(fraction); oversampling (fraction > 1)
     # must therefore produce duplicate reads and an output larger than the input.
     fraction = 2.0
@@ -156,7 +156,7 @@ def test_one_pass_poisson_with_replacement(temp_large_fastq_file):
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=42,
                   output_dir=temp_output_dir, without_replacement=False, unique_headers=False,
-                  one_pass=True, overwrite=True, verbose=False, disable_gzip=True)
+                  single_pass=True, overwrite=True, verbose=False, disable_gzip=True)
         output_fastq_file = os.path.join(temp_output_dir, os.path.basename(temp_large_fastq_file))
 
         num_out = count_reads(output_fastq_file)
@@ -168,13 +168,13 @@ def test_one_pass_poisson_with_replacement(temp_large_fastq_file):
         assert abs(num_out - mean) < 6 * std, f"output size {num_out} far from expected {mean:.0f}"
 
 
-def test_one_pass_pairwise_agreement(temp_large_paired_fastq_files):
-    # Grouped files must remain synchronized in one-pass mode: both mates draw identical
+def test_single_pass_pairwise_agreement(temp_large_paired_fastq_files):
+    # Grouped files must remain synchronized in single-pass mode: both mates draw identical
     # multiplicities from a shared per-group sub-seed.
     fraction = 0.6
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_large_paired_fastq_files, fraction=fraction, seed=42,
-                  output_dir=temp_output_dir, file_group_size=2, without_replacement=True, one_pass=True,
+                  output_dir=temp_output_dir, file_group_size=2, without_replacement=True, single_pass=True,
                   overwrite=True, verbose=False, disable_gzip=True)
 
         out1 = count_reads(os.path.join(temp_output_dir, os.path.basename(temp_large_paired_fastq_files[0])))
@@ -185,17 +185,17 @@ def test_one_pass_pairwise_agreement(temp_large_paired_fastq_files):
                                  temp_output_dir=temp_output_dir, gzip_output=False)
 
 
-def test_one_pass_is_deterministic(temp_large_fastq_file):
+def test_single_pass_is_deterministic(temp_large_fastq_file):
     # The same seed must reproduce byte-identical output across runs.
     fraction = 0.4
     with tempfile.TemporaryDirectory() as dir1, tempfile.TemporaryDirectory() as dir2:
         for out_dir in (dir1, dir2):
             fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=123,
-                      output_dir=out_dir, without_replacement=False, one_pass=True, overwrite=True, verbose=False,
+                      output_dir=out_dir, without_replacement=False, single_pass=True, overwrite=True, verbose=False,
                       disable_gzip=True)
         base = os.path.basename(temp_large_fastq_file)
         with open(os.path.join(dir1, base)) as f1, open(os.path.join(dir2, base)) as f2:
-            assert f1.read() == f2.read(), "one-pass output must be deterministic for a fixed seed"
+            assert f1.read() == f2.read(), "single-pass output must be deterministic for a fixed seed"
 
 
 def test_occurrence_dtype_matches_data():
@@ -210,18 +210,46 @@ def test_occurrence_dtype_matches_data():
     assert smallest_uint_dtype(70000) == np.uint32
 
     n, m = 200000, 200000  # fraction = 1, dense regime
-    for low_memory in (False, True):
-        occ = make_occurrence_list("f", 0, n, m, replacement=True, low_memory=low_memory,
-                                   rng=np.random.default_rng(0), verbose=False)
-        assert occ.dtype == np.uint8, f"expected uint8, got {occ.dtype} (low_memory={low_memory})"
-        # dtype must actually hold the data, and the total must equal the number sampled
-        assert occ.max() <= np.iinfo(occ.dtype).max
-        assert int(occ.sum()) == m, f"occurrence total {int(occ.sum())} != sampled {m}"
+    occ = make_occurrence_list("f", 0, n, m, replacement=True, rng=np.random.default_rng(0), verbose=False)
+    assert occ.dtype == np.uint8, f"expected uint8, got {occ.dtype}"
+    # dtype must actually hold the data, and the total must equal the number sampled
+    assert occ.max() <= np.iinfo(occ.dtype).max
+    assert int(occ.sum()) == m, f"occurrence total {int(occ.sum())} != sampled {m}"
 
     # Without replacement every count is 0 or 1.
-    occ = make_occurrence_list("f", 0, n, m // 2, replacement=False, low_memory=False,
-                               rng=np.random.default_rng(0), verbose=False)
+    occ = make_occurrence_list("f", 0, n, m // 2, replacement=False, rng=np.random.default_rng(0), verbose=False)
     assert occ.max() == 1 and int(occ.sum()) == m // 2
+
+    # Counts above 255 widen the dtype to the smallest one that holds them.
+    occ = make_occurrence_list("f", 0, 10, 10000, replacement=True, rng=np.random.default_rng(0), verbose=False)
+    assert occ.dtype == np.uint16 and int(occ.sum(dtype=np.int64)) == 10000
+
+
+@pytest.mark.parametrize("replacement", [True, False])
+def test_blockwise_occurrence_list_is_uniform(monkeypatch, replacement):
+    # The dense occurrence vector is filled block by block; with a small block size (and a final
+    # partial block) the draws must still total exactly m and be spread uniformly over all reads.
+    import numpy as np
+    import fastQpick.main as fqp_main
+    monkeypatch.setattr(fqp_main, "occurrence_block_size", 997)
+    n = 100_003
+    m = n if replacement else n // 2
+    reps = 20
+    total = np.zeros(n)
+    for rep in range(reps):
+        occ = fqp_main.make_occurrence_list("f", 0, n, m, replacement=replacement, rng=np.random.default_rng(rep), verbose=False)
+        assert int(occ.sum(dtype=np.int64)) == m
+        total += occ
+    # Per-read mean over replicates, averaged within groups of 1000 reads, should be flat at m/n.
+    expected = reps * m / n
+    group_means = total[: (n // 1000) * 1000].reshape(-1, 1000).mean(axis=1)
+    assert np.all(np.abs(group_means - expected) < 6 * np.sqrt(expected / 1000))
+    # Without replacement the counts must be 0/1; with replacement they follow ~Poisson(1).
+    if not replacement:
+        assert total.max() <= reps
+    else:
+        frac_zero = np.mean(occ == 0)
+        assert abs(frac_zero - np.exp(-1)) < 0.01
 
 
 def test_default_mode_is_reproducible(temp_large_fastq_file):
@@ -327,7 +355,7 @@ def read_headers(file_path):
     return [header for header, _, _, _ in read_fastq(file_path, include_plus_line=True)]
 
 
-@pytest.mark.parametrize("mode", [dict(), dict(low_memory=True), dict(one_pass=True)])
+@pytest.mark.parametrize("mode", [dict(), dict(single_pass=True)])
 def test_collapse_duplicates_matches_expanded_output(temp_large_fastq_file, mode):
     # The collapsed output must encode exactly the same multiset of reads as the ordinary output
     # for the same seed: each sampled read once, with its multiplicity in a ";size=<count>" tag.
@@ -351,7 +379,7 @@ def test_collapse_duplicates_matches_expanded_output(temp_large_fastq_file, mode
         assert max(collapsed_counts.values()) > 1, "a full-size bootstrap should contain duplicated reads"
 
 
-@pytest.mark.parametrize("mode", [dict(), dict(low_memory=True), dict(one_pass=True)])
+@pytest.mark.parametrize("mode", [dict(), dict(single_pass=True)])
 @pytest.mark.parametrize("without_replacement,fraction", [(False, 1.0), (True, 0.3)])
 def test_oob_is_complement_of_sample(temp_large_fastq_file, mode, without_replacement, fraction):
     # The out-of-bag file must contain exactly the input reads that are absent from the sample.
@@ -674,17 +702,17 @@ def test_stdin_matches_file_input(tmp_path, temp_large_fastq_file, compress_stdi
     assert (from_pipe / "stdin.fastq").read_bytes() == expected
 
 
-def test_stdin_requires_one_pass(tmp_path, temp_large_fastq_file):
+def test_stdin_requires_single_pass(tmp_path, temp_large_fastq_file):
     # The two-pass modes need to read the library twice, which a stream cannot do.
-    with pytest.raises(ValueError, match="requires one_pass"):
+    with pytest.raises(ValueError, match="requires single_pass"):
         fastQpick(input_files="-", fraction=1.0, seed=42, output_dir=str(tmp_path / "out"),
-                  one_pass=False, disable_gzip=True, overwrite=True, verbose=False)
+                  single_pass=False, disable_gzip=True, overwrite=True, verbose=False)
 
 
 def test_stdin_rejects_additional_inputs(tmp_path, temp_large_fastq_file):
     with pytest.raises(ValueError, match="cannot be combined with other input files"):
         fastQpick(input_files=["-", temp_large_fastq_file], fraction=1.0, seed=42,
-                  output_dir=str(tmp_path / "out"), one_pass=True, disable_gzip=True,
+                  output_dir=str(tmp_path / "out"), single_pass=True, disable_gzip=True,
                   overwrite=True, verbose=False)
 
 
@@ -697,7 +725,7 @@ def test_gzip_output_round_trips(tmp_path, temp_large_fastq_file):
     plain_dir = tmp_path / "plain"
     for out, disable in ((gz_dir, False), (plain_dir, True)):
         fastQpick(input_files=temp_large_fastq_file, fraction=1.0, seed=42, output_dir=str(out),
-                  one_pass=True, disable_gzip=disable, overwrite=True, verbose=False)
+                  single_pass=True, disable_gzip=disable, overwrite=True, verbose=False)
 
     base = os.path.basename(temp_large_fastq_file)
     assert _gzip.open(gz_dir / f"{base}.gz", "rt").read() == (plain_dir / base).read_text()
@@ -731,12 +759,12 @@ def test_read_counts_skips_counting_and_matches(tmp_path, temp_large_fastq_file,
 
 
 @pytest.mark.parametrize("wrong_count", [19999, 20001])
-@pytest.mark.parametrize("fraction, low_memory, oob", [(1.0, False, False), (1.0, True, False), (1.0, False, True), (0.001, False, False)])
-def test_wrong_read_count_raises(tmp_path, temp_large_fastq_file, fresh_length_dict, wrong_count, fraction, low_memory, oob):
+@pytest.mark.parametrize("fraction, oob, without_replacement", [(1.0, False, False), (0.5, False, True), (1.0, True, False), (0.001, False, False)])
+def test_wrong_read_count_raises(tmp_path, temp_large_fastq_file, fresh_length_dict, wrong_count, fraction, oob, without_replacement):
     # Covers the dense-array and Counter (fraction=0.001) occurrence lists and the tagged writer (oob).
     with pytest.raises(ValueError, match="read count used for sampling"):
         fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=42, output_dir=str(tmp_path / "out"),
-                  low_memory=low_memory, oob=oob, read_counts=wrong_count, disable_gzip=True, overwrite=True, verbose=False)
+                  without_replacement=without_replacement, oob=oob, read_counts=wrong_count, disable_gzip=True, overwrite=True, verbose=False)
 
 
 @pytest.mark.parametrize("read_counts", [[20000], [20000, 20000]])
@@ -787,7 +815,7 @@ def test_split_thread_budget():
     assert split_thread_budget(1, 1) == (1, 0)
 
 
-@pytest.mark.parametrize("mode", [dict(), dict(low_memory=True), dict(one_pass=True)])
+@pytest.mark.parametrize("mode", [dict(), dict(single_pass=True)])
 @pytest.mark.parametrize("disable_gzip", [True, False])
 def test_output_independent_of_threads(tmp_path, temp_large_paired_fastq_files, fresh_length_dict, mode, disable_gzip):
     # Parallel counting, and writing several files and seeds at once, must not change the output.

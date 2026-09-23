@@ -3,7 +3,6 @@ import contextlib
 import io
 import itertools
 import os
-import random
 import sys
 import numpy as np
 from tqdm import tqdm
@@ -206,7 +205,7 @@ def check_record_count(input_fastq, num_records, total_reads):
                          "so that the reads are counted.")
 
 def occurrence_chunk_stream(rng, fraction, replacement, chunk_size):
-    # One-pass sampling: lazily yield the number of times each successive read should appear in
+    # Single-pass sampling: lazily yield the number of times each successive read should appear in
     # the output, drawing variates in vectorized chunks of chunk_size for speed. The stream is
     # infinite and is consumed only as far as there are reads, so the file length never needs to
     # be known in advance. With replacement each read's multiplicity is Poisson(fraction); without
@@ -221,7 +220,7 @@ def occurrence_chunk_stream(rng, fraction, replacement, chunk_size):
         for count in chunk:
             yield count
 
-def write_fastq_one_pass(input_fastq, output_path, fraction, replacement, child_seed, gzip_output, seed=None, unique_headers=False, collapse_duplicates=False, oob_path=None, verbose=True, gzip_threads=gzip_output_threads):
+def write_fastq_single_pass(input_fastq, output_path, fraction, replacement, child_seed, gzip_output, seed=None, unique_headers=False, collapse_duplicates=False, oob_path=None, verbose=True, gzip_threads=gzip_output_threads):
     # Single-pass writer. A read's output multiplicity is drawn as the file streams by, so the read
     # count is never needed and peak memory is constant (only the flush buffer). All members of a
     # group are passed the same child_seed, so re-seeding here reproduces the identical multiplicity
@@ -284,90 +283,66 @@ def smallest_uint_dtype(max_value):
 # A Counter entry costs on the order of 100 bytes (dict slot plus two Python int objects), whereas a
 # dense occurrence vector costs total_reads * dtype_bytes and the per-read count almost always fits
 # in one byte. The sparse representation therefore only saves memory when the number of sampled reads
-# is a small fraction of the file; below this ratio the Counter (which also avoids allocating the
-# length-n bincount temporary) wins, above it the dense array wins.
+# is a small fraction of the file; below this ratio the Counter wins, above it the dense array wins.
 counter_sparsity_threshold = 100
 
-# Chunk length for the dense low-memory samplers (see make_occurrence_list).
-low_memory_chunk_size = 1_000_000
+# Number of reads per block when the dense occurrence vector is filled block by block (see
+# make_occurrence_list). Working memory beyond the occurrence vector itself is O(block size).
+occurrence_block_size = 1_000_000
 
-def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, low_memory, rng=None, verbose=True):
+def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, replacement, rng, verbose=True):
+    # Return how many times each read (by position) is drawn in an exact uniform sample of
+    # number_of_reads_to_sample reads. rng is a seeded numpy Generator threaded down from
+    # sample_multiple_files so that the output is reproducible.
     if verbose:
         logger.info(f"Calculating total reads and determining random indices for seed {seed}, file {file}")
 
-    use_counter = number_of_reads_to_sample < (total_reads / counter_sparsity_threshold)
+    n, m = total_reads, number_of_reads_to_sample
 
-    if low_memory and not use_counter:
-        # Dense low-memory path. Draws are processed in fixed-size chunks and accumulated straight
-        # into the occurrence array, so neither the full array of m sampled indices nor the length-n
-        # bincount temporary of the default path is ever materialized; memory is the occurrence array
-        # plus one chunk. With replacement, each chunk of indices is drawn uniformly and added in place.
-        # Without replacement, random.sample would hold a set of m indices as Python ints, which costs
-        # far more than the occurrence array itself, so instead the reads are visited in chunks: the
-        # number drawn from each chunk is Hypergeometric in the reads and draws still remaining, and
-        # those reads are chosen uniformly within the chunk. Both are exactly uniform sampling.
+    if m < n / counter_sparsity_threshold:
+        # Sparse case: the m sampled indices are few, so they are drawn at once and counted in a Counter.
         if replacement:
-            # Counts are ~Poisson(fraction); uint16 leaves an enormous safety margin (a single read would
-            # need to be drawn 65,535 times to overflow) and is downcast to the realized maximum below.
-            occurrence_list = np.zeros(total_reads, dtype=np.uint16)
-            dtype_random_indices = np.uint32 if total_reads <= np.iinfo(np.uint32).max else np.uint64
-            remaining_draws = number_of_reads_to_sample
-            while remaining_draws > 0:
-                k = min(low_memory_chunk_size, remaining_draws)
-                np.add.at(occurrence_list, rng.integers(0, total_reads, size=k, dtype=dtype_random_indices), 1)
-                remaining_draws -= k
-            realized_dtype = smallest_uint_dtype(int(occurrence_list.max()) if occurrence_list.size else 0)
-            if realized_dtype != occurrence_list.dtype:
-                occurrence_list = occurrence_list.astype(realized_dtype)
+            dtype_random_indices = np.uint32 if n <= np.iinfo(np.uint32).max else np.uint64
+            random_indices = rng.integers(0, n, size=m, dtype=dtype_random_indices)
         else:
-            # Without replacement each index is distinct, so the count is exactly one and uint8 is provably sufficient.
-            occurrence_list = np.zeros(total_reads, dtype=np.uint8)
-            remaining_draws = number_of_reads_to_sample
-            for start in range(0, total_reads, low_memory_chunk_size):
-                chunk_len = min(low_memory_chunk_size, total_reads - start)
-                remaining_reads = total_reads - start
-                if remaining_draws <= 0:
-                    break
-                if remaining_draws >= remaining_reads:
-                    k = chunk_len
-                else:
-                    k = int(rng.hypergeometric(remaining_draws, remaining_reads - remaining_draws, chunk_len))
-                if k:
-                    occurrence_list[start + rng.choice(chunk_len, size=k, replace=False)] = 1
-                    remaining_draws -= k
-        return occurrence_list
+            random_indices = rng.choice(n, size=m, replace=False)
+        return Counter(random_indices.tolist())
 
-    if low_memory:
-        # Sparse case: the sample is small, so a lazy stdlib generator feeding a Counter is cheapest.
-        if replacement:
-            random_indices = (random.choice(range(total_reads)) for _ in range(number_of_reads_to_sample))
-        else:
-            random_indices = (index for index in random.sample(range(total_reads), k=number_of_reads_to_sample))
-        occurrence_list = Counter(random_indices)
+    # Dense case: the reads are split into blocks and the occurrence vector is filled one block at a
+    # time, so neither the m sampled indices nor a length-n counting temporary is ever materialized.
+    # The number of draws landing in each block is drawn first (Multinomial with replacement,
+    # Hypergeometric without), and the draws are then placed uniformly within the block, which is
+    # exactly uniform sampling of m reads from the whole file.
+    occurrence_list = np.zeros(n, dtype=np.uint8)
+    remaining_draws = m
+    if replacement:
+        block_starts = np.arange(0, n, occurrence_block_size)
+        block_lengths = np.minimum(occurrence_block_size, n - block_starts)
+        draws_per_block = rng.multinomial(m, block_lengths / n)
+        for start, block_length, k in zip(block_starts, block_lengths, draws_per_block):
+            if not k:
+                continue
+            counts = np.bincount(rng.integers(0, block_length, size=k, dtype=np.uint32), minlength=block_length)
+            # Counts are ~Poisson(fraction), so uint8 almost always suffices; widen only if a count
+            # actually exceeds it, keeping the dtype at the smallest one that holds the realized maximum.
+            max_count = int(counts.max())
+            if max_count > np.iinfo(occurrence_list.dtype).max:
+                occurrence_list = occurrence_list.astype(smallest_uint_dtype(max_count))
+            occurrence_list[start:start + block_length] = counts
     else:
-        # rng is a seeded numpy Generator threaded down from sample_multiple_files so that the default
-        # path is reproducible (the legacy global np.random it previously used was never seeded).
-        if replacement:
-            # Drawing integers directly avoids materializing a length-n arange just to index into it.
-            dtype_random_indices = np.uint32 if total_reads <= np.iinfo(np.uint32).max else np.uint64
-            random_indices = rng.integers(0, total_reads, size=number_of_reads_to_sample, dtype=dtype_random_indices)
-        else:
-            # Sampling without replacement requires a permutation, which numpy materializes internally.
-            random_indices = rng.choice(total_reads, size=number_of_reads_to_sample, replace=False)
-
-        # Count occurrences
-        if use_counter:
-            occurrence_list = Counter(random_indices.tolist())
-        else:
-            counts = np.bincount(random_indices, minlength=total_reads)
-            # Size the occurrence vector to the realized maximum count rather than to the sample size,
-            # which over-provisions by 4-8x; the maximum is almost always small enough for uint8.
-            dtype_occurences_list = smallest_uint_dtype(int(counts.max()) if counts.size else 0)
-            occurrence_list = counts.astype(dtype_occurences_list)
-            del counts
-
-    del random_indices
-
+        # Without replacement each read is drawn at most once, so uint8 is provably sufficient.
+        for start in range(0, n, occurrence_block_size):
+            if remaining_draws <= 0:
+                break
+            block_length = min(occurrence_block_size, n - start)
+            remaining_reads = n - start
+            if remaining_draws >= remaining_reads:
+                k = block_length
+            else:
+                k = int(rng.hypergeometric(remaining_draws, remaining_reads - remaining_draws, block_length))
+            if k:
+                occurrence_list[start + rng.choice(block_length, size=k, replace=False)] = 1
+                remaining_draws -= k
     return occurrence_list
 
 def insert_suffix(filename, suffix):
@@ -397,7 +372,7 @@ def resolve_output_path(file, output_directory, gzip_output, multiple_seeds, see
         output_path = output_path[:-3]
     return output_path
 
-def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_output_threads):
+def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_output_threads):
     # Lazily yield (callable, kwargs) write jobs for one seed. Each group's occurrence list is built
     # HERE, in the parent process, so the shared `rng` is consumed in exactly the same order as the
     # single-process path; only the I/O-bound write_fastq call is handed off as a job. This keeps the
@@ -409,15 +384,15 @@ def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacem
         total_reads = fastq_to_length_dict[files_total[0]]
         number_of_reads_to_sample = int(fraction * total_reads)
 
-        occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, low_memory=low_memory, rng=rng, verbose=verbose)
+        occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, rng=rng, verbose=verbose)
 
         for member in files_total:
             output_path = resolve_output_path(member, output, gzip_output, multiple_seeds, seed)
             oob_path = insert_suffix(output_path, "oob") if oob else None
             yield write_fastq, dict(input_fastq=member, output_path=output_path, occurrence_list=occurrence_list, total_reads=total_reads, gzip_output=gzip_output, seed=seed, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob_path=oob_path, verbose=verbose, gzip_threads=gzip_threads)
 
-def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, unique_headers = False, collapse_duplicates = False, oob = False, multiple_seeds = False, verbose=True, gzip_threads=gzip_output_threads):
-    # One-pass counterpart of bootstrap_single_file. No occurrence vector is materialized and the
+def bootstrap_single_file_single_pass(files_total = None, child_seed = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, unique_headers = False, collapse_duplicates = False, oob = False, multiple_seeds = False, verbose=True, gzip_threads=gzip_output_threads):
+    # Single-pass counterpart of bootstrap_single_file. No occurrence vector is materialized and the
     # file length is never counted; every member of the group is written from the same child_seed
     # so their sampled multiplicities match read-for-read, keeping mate pairs synchronized.
     if isinstance(files_total, str):
@@ -427,7 +402,7 @@ def bootstrap_single_file_one_pass(files_total = None, child_seed = None, gzip_o
         output_path = resolve_output_path(file, output_directory, gzip_output, multiple_seeds, seed)
         oob_path = insert_suffix(output_path, "oob") if oob else None
 
-        write_fastq_one_pass(input_fastq = file, output_path = output_path, fraction = fraction, replacement = replacement, child_seed = child_seed, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, collapse_duplicates = collapse_duplicates, oob_path = oob_path, verbose = verbose, gzip_threads = gzip_threads)
+        write_fastq_single_pass(input_fastq = file, output_path = output_path, fraction = fraction, replacement = replacement, child_seed = child_seed, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, collapse_duplicates = collapse_duplicates, oob_path = oob_path, verbose = verbose, gzip_threads = gzip_threads)
 
 def run_write_jobs(jobs, max_workers):
     # Execute (callable, kwargs) write jobs. The write stage is dominated by I/O (read, optional
@@ -469,37 +444,35 @@ def split_thread_budget(threads, num_jobs):
     gzip_threads = min(gzip_output_threads, threads // workers - 1)
     return workers, gzip_threads
 
-def one_pass_jobs_all_seeds(file_list, seed_list, output, gzip_output, fraction, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, verbose, gzip_threads):
+def single_pass_jobs_all_seeds(file_list, seed_list, output, gzip_output, fraction, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, verbose, gzip_threads):
     for seed in seed_list:
         # Derive one independent sub-seed per group from the master seed. Members of a group share
-        # their sub-seed (handled inside bootstrap_single_file_one_pass) so mates stay synchronized,
+        # their sub-seed (handled inside bootstrap_single_file_single_pass) so mates stay synchronized,
         # while different groups draw independently, mirroring the two-pass path where each file
         # consumes fresh random state. Each (seed, group) pair is fully independent, so it is one
         # parallel write job.
         child_seeds = np.random.SeedSequence(seed).spawn(len(file_list))
         for file, child_seed in zip(file_list, child_seeds):
-            yield bootstrap_single_file_one_pass, dict(files_total=file, child_seed=child_seed, gzip_output=gzip_output, output_directory=output, seed=seed, fraction=fraction, replacement=replacement, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob=oob, multiple_seeds=multiple_seeds, verbose=verbose, gzip_threads=gzip_threads)
+            yield bootstrap_single_file_single_pass, dict(files_total=file, child_seed=child_seed, gzip_output=gzip_output, output_directory=output, seed=seed, fraction=fraction, replacement=replacement, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob=oob, multiple_seeds=multiple_seeds, verbose=verbose, gzip_threads=gzip_threads)
 
-def two_pass_jobs_all_seeds(file_list, seed_list, fraction, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, verbose, gzip_threads):
+def two_pass_jobs_all_seeds(file_list, seed_list, fraction, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, verbose, gzip_threads):
     for seed in seed_list:
-        # Seed both RNGs once per seed: stdlib random drives the low-memory Counter path, and a numpy
-        # Generator drives the other paths. A single Generator is shared across the seed's files so
+        # Seed a numpy Generator once per seed. A single Generator is shared across the seed's files so
         # that successive files draw independent samples while remaining reproducible. This generator
-        # is consumed lazily in the parent, so a seed's RNGs are (re)seeded only after every
+        # is consumed lazily in the parent, so a seed's RNG is (re)seeded only after every
         # occurrence list of the previous seed has been built; the RNG state each list sees is
         # therefore the same as in a serial run, however the writes are scheduled across processes.
-        random.seed(seed)
         rng = np.random.default_rng(seed)
-        yield from two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, low_memory, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_threads)
+        yield from two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_threads)
 
-def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, low_memory, unique_headers, one_pass, verbose, collapse_duplicates=False, oob=False, threads=None):
+def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, unique_headers, single_pass, verbose, collapse_duplicates=False, oob=False, threads=None):
     multiple_seeds = len(seed_list) > 1
     threads = resolve_threads(threads)
     # Jobs from every seed share one pool, so replicates of a single file run in parallel as well as
-    # distinct files. A job is a whole group in one-pass mode (its members re-derive the same
+    # distinct files. A job is a whole group in single-pass mode (its members re-derive the same
     # multiplicities from a shared sub-seed) and an individual output file in two-pass mode (group
     # members share an occurrence list built in the parent).
-    if one_pass:
+    if single_pass:
         num_jobs = len(file_list) * len(seed_list)
     else:
         num_individual_files = sum(len(file) if isinstance(file, tuple) else 1 for file in file_list)
@@ -509,10 +482,10 @@ def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, r
     max_workers, gzip_threads = split_thread_budget(threads, num_jobs)
 
     common = dict(file_list=file_list, seed_list=seed_list, output=output, gzip_output=gzip_output, fraction=fraction, replacement=replacement, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob=oob, multiple_seeds=multiple_seeds, verbose=verbose, gzip_threads=gzip_threads)
-    if one_pass:
-        jobs = one_pass_jobs_all_seeds(**common)
+    if single_pass:
+        jobs = single_pass_jobs_all_seeds(**common)
     else:
-        jobs = two_pass_jobs_all_seeds(low_memory=low_memory, **common)
+        jobs = two_pass_jobs_all_seeds(**common)
     run_write_jobs(jobs, max_workers=max_workers)
 
 def make_fastq_to_length_dict(file_list, verbose=True, threads=None):
@@ -585,9 +558,8 @@ def fastQpick(
     file_group_size: int = 1,
     without_replacement: bool = False,
     overwrite: bool = False,
-    low_memory: bool = False,
     unique_headers: Union[bool, None] = None,
-    one_pass: bool = False,
+    single_pass: bool = False,
     collapse_duplicates: bool = False,
     oob: bool = False,
     read_counts: Union[int, list, dict, None] = None,
@@ -609,12 +581,11 @@ def fastQpick(
     file_group_size (int)                   The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.
     without_replacement (bool)              Sample without replacement. Automatically disabled if fraction >= 1.
     overwrite (bool)                        Overwrite existing output files.
-    low_memory (bool)                       Activate low memory mode. Disabled if one_pass is True.
     unique_headers (bool)                   Add a unique identifier to the header names of the output files. Default False if without_replacement is True, True if without_replacement is False.
-    one_pass (bool)                         Use the single-pass approximate sampler. Uses low memory and runs faster in some cases (when the fraction is small or the input is large compared to available memory).
+    single_pass (bool)                      Read the input once instead of twice, using constant memory. The output size is exact only in expectation (relative standard deviation 1/sqrt(fraction * n)). Required to read from standard input.
     collapse_duplicates (bool)              Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Reduces output size when sampling with replacement. Overrides unique_headers.
     oob (bool)                              Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file for each output file.
-    read_counts (int, list, or dict)        Number of reads in each input file, to skip the counting pass of the two-pass modes. Either a dict mapping each file path to its read count, or an int / list of ints in input order (after directory expansion), with one count per file or one per group. Ignored when one_pass is True. The writing pass checks each count and raises an error if it does not match the file.
+    read_counts (int, list, or dict)        Number of reads in each input file, to skip the counting pass of the two-pass modes. Either a dict mapping each file path to its read count, or an int / list of ints in input order (after directory expansion), with one count per file or one per group. Ignored when single_pass is True. The writing pass checks each count and raises an error if it does not match the file.
     threads (int)                           Total number of threads (CPU cores) to use, shared between parallel file/replicate jobs and gzip compression. Defaults to 4, or to the number of available cores if fewer. Output does not depend on this value.
     verbose (bool)                          Whether to print progress information.
 
@@ -622,6 +593,9 @@ def fastQpick(
     ------
     fastq_to_length_dict (dict)             Dictionary of FASTQ file paths to number of reads in each file. If not provided, will be calculated.
     """
+    if "one_pass" in kwargs:  # deprecated name of single_pass
+        logger.warning("one_pass is deprecated; use single_pass instead.")
+        single_pass = single_pass or bool(kwargs.pop("one_pass"))
     replacement = not without_replacement
     if threads is not None and threads < 1:
         raise ValueError(f"threads must be a positive integer, got {threads}.")
@@ -660,11 +634,6 @@ def fastQpick(
     if float(fraction) >= 1.0:
         replacement = True
 
-    # low_memory only governs the two-pass occurrence-vector construction; the one-pass sampler
-    # never builds that vector, so the flag has nothing to act on there.
-    if one_pass and low_memory and verbose:
-        logger.warning("low_memory has no effect in one_pass mode, which already runs in O(1) memory.")
-
     # go through files, and only keep those that are valid fastq files or that are a folder containing valid fastq files in the direct subdirectory
     if isinstance(input_files, str):
         input_files = [input_files]
@@ -698,13 +667,13 @@ def fastQpick(
     fraction = float(fraction)  # make sure fraction is a float (not a string)
 
     # Standard input is not seekable and its length is not known in advance, so it is only
-    # compatible with the one-pass sampler reading a single, ungrouped stream.
+    # compatible with the single-pass sampler reading a single, ungrouped stream.
     if STDIN_SENTINEL in input_files_parsed:
         if len(input_files_parsed) > 1:
             raise ValueError("Reading from standard input ('-') cannot be combined with other input files.")
-        if not one_pass:
-            raise ValueError("Reading from standard input ('-') requires one_pass=True (--one-pass on the "
-                             "command line): the default and low-memory modes must read the library twice, "
+        if not single_pass:
+            raise ValueError("Reading from standard input ('-') requires single_pass=True (--single-pass on the "
+                             "command line): the default (exact) mode must read the library twice, "
                              "which a stream does not allow.")
         if file_group_size > 1:
             raise ValueError("Reading from standard input ('-') cannot be combined with file grouping "
@@ -722,19 +691,19 @@ def fastQpick(
     if not replacement and unique_headers:
         logger.warning(f"unique_headers is {unique_headers} but replacement is {replacement}. This may lead to unnecessarily verbose header names in the output files. Consider setting unique_headers to {replacement} to match the replacement setting.")
     
-    # Count reads in each file and store in a dictionary. The one-pass sampler does not need the
+    # Count reads in each file and store in a dictionary. The single-pass sampler does not need the
     # counts, so this pass is skipped entirely in that mode. Files with a user-supplied count are
     # not counted.
-    if read_counts is not None and one_pass:
+    if read_counts is not None and single_pass:
         if verbose:
-            logger.warning("read_counts has no effect in one_pass mode, which never counts the reads.")
+            logger.warning("read_counts has no effect in single_pass mode, which never counts the reads.")
     elif read_counts is not None:
         apply_read_counts(read_counts, input_files_parsed)
-    if not one_pass:
+    if not single_pass:
         make_fastq_to_length_dict(input_files_parsed, verbose=verbose, threads=threads)
 
     # Do the sampling
-    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seeds, output=output_dir, gzip_output=gzip_output, replacement=replacement, low_memory=low_memory, unique_headers=unique_headers, one_pass=one_pass, verbose=verbose, collapse_duplicates=collapse_duplicates, oob=oob, threads=threads)
+    sample_multiple_files(file_list=input_files_parsed, fraction=fraction, seed_list=seeds, output=output_dir, gzip_output=gzip_output, replacement=replacement, unique_headers=unique_headers, single_pass=single_pass, verbose=verbose, collapse_duplicates=collapse_duplicates, oob=oob, threads=threads)
 
 def parse_read_counts(value):
     # argparse type for --read-counts: a comma-separated list of integers. A single token is used
@@ -755,12 +724,12 @@ def main():
     parser.add_argument("-g", "--file-group-size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.")
     parser.add_argument("-dr", "--without-replacement", action="store_true", help="Sample without replacement. Automatically disabled if fraction >= 1.")
     parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files.")
-    parser.add_argument("-l", "--low-memory", action="store_true", help="Activate low memory mode. Disabled if one_pass is True.")
     parser.add_argument("-u", "--unique-headers", action="store_true", default=None, help="Add a unique identifier to the header names of the output files. Defaults to True when sampling with replacement, False otherwise.")
-    parser.add_argument("-p", "--one_pass", action="store_true", help="Use the single-pass approximate sampler. Uses low memory and runs faster in some cases (when the fraction is small or the input is large compared to available memory).")
+    parser.add_argument("-p", "--single-pass", action="store_true", help="Read the input once instead of twice, using constant memory. The output size is exact only in expectation (relative standard deviation 1/sqrt(fraction * n)). Required to read from standard input.")
+    parser.add_argument("--one-pass", "--one_pass", dest="single_pass", action="store_true", help=argparse.SUPPRESS)  # deprecated alias
     parser.add_argument("-c", "--collapse-duplicates", action="store_true", help='Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Overrides --unique-headers.')
     parser.add_argument("--oob", action="store_true", help='Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file.')
-    parser.add_argument("--read-counts", required=False, type=parse_read_counts, default=None, help="Comma-separated number of reads in each input file, in input order (one per file, or one per group with -g), e.g. --read-counts 5725730,5725730. Skips the counting pass. Ignored with --one_pass. An error is raised if a count does not match its file.")
+    parser.add_argument("--read-counts", required=False, type=parse_read_counts, default=None, help="Comma-separated number of reads in each input file, in input order (one per file, or one per group with -g), e.g. --read-counts 5725730,5725730. Skips the counting pass. Ignored with --single-pass. An error is raised if a count does not match its file.")
     parser.add_argument("-t", "--threads", required=False, type=int, default=None, help="Total number of threads to use, shared between parallel file/replicate jobs and gzip compression. Default: 4, or the number of available cores if fewer. Output does not depend on this value.")
     parser.add_argument("-q", "--quiet", action="store_false", help="Whether to print progress information.")
     parser.add_argument("-v", "--version", action="version", version=f"fastQpick {__version__}", help="Show program's version number and exit")
@@ -780,9 +749,8 @@ def main():
               file_group_size=args.file_group_size,
               without_replacement=args.without_replacement,
               overwrite=args.overwrite,
-              low_memory=args.low_memory,
               unique_headers=args.unique_headers,
-              one_pass=args.one_pass,
+              single_pass=args.single_pass,
               collapse_duplicates=args.collapse_duplicates,
               oob=args.oob,
               read_counts=args.read_counts,
