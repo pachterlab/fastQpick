@@ -1,0 +1,23 @@
+	Command being timed: "bash -c fastQpick -f 0.2 -dr -z -s 42 -t 1 -o /home/jrich/Desktop/fastQpick/benchmarks/work/out -w -q /home/jrich/Desktop/fastQpick/trash/bench_500M_v2.fastq.gz"
+	User time (seconds): 1792.90
+	System time (seconds): 91.99
+	Percent of CPU this job got: 97%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 32:16.45
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 561944
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 5
+	Minor (reclaiming a frame) page faults: 8179381
+	Voluntary context switches: 377
+	Involuntary context switches: 12951
+	Swaps: 0
+	File system inputs: 77875360
+	File system outputs: 61719088
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

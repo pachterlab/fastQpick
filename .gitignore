@@ -175,3 +175,8 @@ notebooks/realdata/reps/
 notebooks/realdata/progress.log
 notebooks/realdata/drive.out
 notebooks/realdata/targets.txt
+
+# benchmark scratch output
+benchmarks/work/
+notebooks/realdata/tmp/
+*.nohup

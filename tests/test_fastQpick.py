@@ -155,7 +155,7 @@ def test_single_pass_poisson_with_replacement(temp_large_fastq_file):
     n = count_reads(temp_large_fastq_file)
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=42,
-                  output_dir=temp_output_dir, without_replacement=False, unique_headers=False,
+                  output_dir=temp_output_dir, without_replacement=False, no_unique_headers=True,
                   single_pass=True, overwrite=True, verbose=False, disable_gzip=True)
         output_fastq_file = os.path.join(temp_output_dir, os.path.basename(temp_large_fastq_file))
 
@@ -362,7 +362,7 @@ def test_collapse_duplicates_matches_expanded_output(temp_large_fastq_file, mode
     base = os.path.basename(temp_large_fastq_file)
     with tempfile.TemporaryDirectory() as dir_expanded, tempfile.TemporaryDirectory() as dir_collapsed:
         common = dict(input_files=temp_large_fastq_file, fraction=1.0, seed=7, overwrite=True, verbose=False, disable_gzip=True, **mode)
-        fastQpick(output_dir=dir_expanded, unique_headers=False, **common)
+        fastQpick(output_dir=dir_expanded, no_unique_headers=True, **common)
         fastQpick(output_dir=dir_collapsed, collapse_duplicates=True, **common)
 
         expanded_counts = {}
@@ -386,7 +386,7 @@ def test_oob_is_complement_of_sample(temp_large_fastq_file, mode, without_replac
     base = os.path.basename(temp_large_fastq_file)
     with tempfile.TemporaryDirectory() as temp_output_dir:
         fastQpick(input_files=temp_large_fastq_file, fraction=fraction, seed=11, output_dir=temp_output_dir,
-                  without_replacement=without_replacement, unique_headers=False, oob=True, overwrite=True,
+                  without_replacement=without_replacement, no_unique_headers=True, oob=True, overwrite=True,
                   verbose=False, disable_gzip=True, **mode)
         oob_file = os.path.join(temp_output_dir, base.replace(".fastq", ".oob.fastq"))
         validate_fastq_format(oob_file, ground_truth=make_fastq_dict(temp_large_fastq_file))
@@ -501,7 +501,7 @@ def test_single_file(temp_fastq_file):
                 disable_gzip=not gzip_output,
                 file_group_size=group_size,
                 without_replacement=not replacement,
-                unique_headers=False,
+                no_unique_headers=True,
                 overwrite=True
                 )
         
@@ -522,7 +522,7 @@ def test_single_file_bootstrapped(temp_fastq_file):
                 disable_gzip=not gzip_output,
                 file_group_size=group_size,
                 without_replacement=not replacement,
-                unique_headers=False,
+                no_unique_headers=True,
                 overwrite=True
                 )
         
@@ -545,7 +545,7 @@ def test_single_file_oversampled(temp_fastq_file):
                 disable_gzip=not gzip_output,
                 file_group_size=group_size,
                 without_replacement=not replacement,
-                unique_headers=False,
+                no_unique_headers=True,
                 overwrite=True
                 )
         
@@ -568,7 +568,7 @@ def test_single_gzipped(temp_fastq_file):
                 disable_gzip=not gzip_output,
                 file_group_size=group_size,
                 without_replacement=not replacement,
-                unique_headers=False,
+                no_unique_headers=True,
                 overwrite=True
                 )
         
@@ -592,7 +592,7 @@ def test_paired_files(temp_paired_fastq_files):
                 disable_gzip=not gzip_output,
                 file_group_size=group_size,
                 without_replacement=not replacement,
-                unique_headers=False,
+                no_unique_headers=True,
                 overwrite=True
                 )
         
@@ -618,7 +618,7 @@ def test_paired_files_bootstrapped(temp_paired_fastq_files):
                 disable_gzip=not gzip_output,
                 file_group_size=group_size,
                 without_replacement=not replacement,
-                unique_headers=False,
+                no_unique_headers=True,
                 overwrite=True
                 )
         
@@ -770,7 +770,7 @@ def test_wrong_read_count_raises(tmp_path, temp_large_fastq_file, fresh_length_d
 @pytest.mark.parametrize("read_counts", [[20000], [20000, 20000]])
 def test_read_counts_per_group_or_per_file(tmp_path, temp_large_paired_fastq_files, fresh_length_dict, read_counts):
     fastQpick(input_files=temp_large_paired_fastq_files, fraction=1.0, seed=42, output_dir=str(tmp_path / "out"),
-              file_group_size=2, read_counts=read_counts, unique_headers=False, disable_gzip=True, overwrite=True, verbose=False)
+              file_group_size=2, read_counts=read_counts, no_unique_headers=True, disable_gzip=True, overwrite=True, verbose=False)
     check_pairwise_agreement(temp_paired_fastq_files=temp_large_paired_fastq_files, temp_output_dir=str(tmp_path / "out"), gzip_output=False)
 
 
@@ -844,3 +844,13 @@ def test_resolve_threads(monkeypatch):
 def test_invalid_threads_rejected(tmp_path, temp_large_fastq_file):
     with pytest.raises(ValueError, match="threads"):
         fastQpick(input_files=temp_large_fastq_file, fraction=0.5, output_dir=str(tmp_path / "out"), threads=0, overwrite=True, verbose=False)
+
+
+def test_openblas_threads_pinned_on_import():
+    # numpy's OpenBLAS pool is pinned to one thread when fastQpick is imported first (the CLI
+    # path), and an explicit user setting is respected.
+    import subprocess, sys
+    env = {k: v for k, v in os.environ.items() if k != "OPENBLAS_NUM_THREADS"}
+    code = "import fastQpick, os; print(os.environ.get('OPENBLAS_NUM_THREADS'))"
+    assert subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True).stdout.strip() == "1"
+    assert subprocess.run([sys.executable, "-c", code], env={**env, "OPENBLAS_NUM_THREADS": "8"}, capture_output=True, text=True, check=True).stdout.strip() == "8"

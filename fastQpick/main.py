@@ -558,7 +558,7 @@ def fastQpick(
     file_group_size: int = 1,
     without_replacement: bool = False,
     overwrite: bool = False,
-    unique_headers: Union[bool, None] = None,
+    no_unique_headers: bool = False,
     single_pass: bool = False,
     collapse_duplicates: bool = False,
     oob: bool = False,
@@ -581,9 +581,9 @@ def fastQpick(
     file_group_size (int)                   The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.
     without_replacement (bool)              Sample without replacement. Automatically disabled if fraction >= 1.
     overwrite (bool)                        Overwrite existing output files.
-    unique_headers (bool)                   Add a unique identifier to the header names of the output files. Default False if without_replacement is True, True if without_replacement is False.
+    no_unique_headers (bool)                Keep the original read headers when sampling with replacement. By default each repeated read gets a unique suffix (_1, _2, ...) so that no two output records share a header. Ignored when sampling without replacement, where every header is already unique.
     single_pass (bool)                      Read the input once instead of twice, using constant memory. The output size is exact only in expectation (relative standard deviation 1/sqrt(fraction * n)). Required to read from standard input.
-    collapse_duplicates (bool)              Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Reduces output size when sampling with replacement. Overrides unique_headers.
+    collapse_duplicates (bool)              Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Reduces output size when sampling with replacement. Overrides no_unique_headers.
     oob (bool)                              Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file for each output file.
     read_counts (int, list, or dict)        Number of reads in each input file, to skip the counting pass of the two-pass modes. Either a dict mapping each file path to its read count, or an int / list of ints in input order (after directory expansion), with one count per file or one per group. Ignored when single_pass is True. The writing pass checks each count and raises an error if it does not match the file.
     threads (int)                           Total number of threads (CPU cores) to use, shared between parallel file/replicate jobs and gzip compression. Defaults to 4, or to the number of available cores if fewer. Output does not depend on this value.
@@ -593,9 +593,9 @@ def fastQpick(
     ------
     fastq_to_length_dict (dict)             Dictionary of FASTQ file paths to number of reads in each file. If not provided, will be calculated.
     """
-    if "one_pass" in kwargs:  # deprecated name of single_pass
-        logger.warning("one_pass is deprecated; use single_pass instead.")
-        single_pass = single_pass or bool(kwargs.pop("one_pass"))
+    unexpected = set(kwargs) - {"fastq_to_length_dict"}
+    if unexpected:
+        raise TypeError(f"fastQpick() got unexpected keyword argument(s): {', '.join(sorted(unexpected))}")
     replacement = not without_replacement
     if threads is not None and threads < 1:
         raise ValueError(f"threads must be a positive integer, got {threads}.")
@@ -682,15 +682,10 @@ def fastQpick(
     if file_group_size > 1:
         input_files_parsed = group_items(input_files_parsed, group_size=file_group_size)
     
-    if collapse_duplicates:
-        unique_headers = False  # each read is written once, so its header is already unique
-    if unique_headers is None:
-        unique_headers = replacement  # default to True if replacement is True, False if replacement is False
-    if replacement and not unique_headers and not collapse_duplicates:
-        logger.warning(f"unique_headers is {unique_headers} but replacement is {replacement}. This may lead to duplicate header names in the output files, which can cause issues for downstream tools. Consider setting unique_headers to {replacement} to match the replacement setting.")
-    if not replacement and unique_headers:
-        logger.warning(f"unique_headers is {unique_headers} but replacement is {replacement}. This may lead to unnecessarily verbose header names in the output files. Consider setting unique_headers to {replacement} to match the replacement setting.")
-    
+    # Headers are made unique only for reads that can repeat, i.e. with replacement. Collapsed
+    # output writes each read once, so its header is already unique.
+    unique_headers = replacement and not no_unique_headers and not collapse_duplicates
+
     # Count reads in each file and store in a dictionary. The single-pass sampler does not need the
     # counts, so this pass is skipped entirely in that mode. Files with a user-supplied count are
     # not counted.
@@ -724,10 +719,9 @@ def main():
     parser.add_argument("-g", "--file-group-size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.")
     parser.add_argument("-dr", "--without-replacement", action="store_true", help="Sample without replacement. Automatically disabled if fraction >= 1.")
     parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files.")
-    parser.add_argument("-u", "--unique-headers", action="store_true", default=None, help="Add a unique identifier to the header names of the output files. Defaults to True when sampling with replacement, False otherwise.")
+    parser.add_argument("--no-unique-headers", action="store_true", help="Keep the original read headers when sampling with replacement. By default each repeated read gets a unique suffix (_1, _2, ...). Ignored when sampling without replacement.")
     parser.add_argument("-p", "--single-pass", action="store_true", help="Read the input once instead of twice, using constant memory. The output size is exact only in expectation (relative standard deviation 1/sqrt(fraction * n)). Required to read from standard input.")
-    parser.add_argument("--one-pass", "--one_pass", dest="single_pass", action="store_true", help=argparse.SUPPRESS)  # deprecated alias
-    parser.add_argument("-c", "--collapse-duplicates", action="store_true", help='Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Overrides --unique-headers.')
+    parser.add_argument("-c", "--collapse-duplicates", action="store_true", help='Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Overrides --no-unique-headers.')
     parser.add_argument("--oob", action="store_true", help='Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file.')
     parser.add_argument("--read-counts", required=False, type=parse_read_counts, default=None, help="Comma-separated number of reads in each input file, in input order (one per file, or one per group with -g), e.g. --read-counts 5725730,5725730. Skips the counting pass. Ignored with --single-pass. An error is raised if a count does not match its file.")
     parser.add_argument("-t", "--threads", required=False, type=int, default=None, help="Total number of threads to use, shared between parallel file/replicate jobs and gzip compression. Default: 4, or the number of available cores if fewer. Output does not depend on this value.")
@@ -749,7 +743,7 @@ def main():
               file_group_size=args.file_group_size,
               without_replacement=args.without_replacement,
               overwrite=args.overwrite,
-              unique_headers=args.unique_headers,
+              no_unique_headers=args.no_unique_headers,
               single_pass=args.single_pass,
               collapse_duplicates=args.collapse_duplicates,
               oob=args.oob,
