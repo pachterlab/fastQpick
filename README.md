@@ -56,12 +56,12 @@ Write plain (uncompressed) FASTQ:
 fastQpick -f 1 --disable-gzip sample.fastq.gz
 ```
 
-Also save the out-of-bag reads (the reads that were not drawn) of each replicate to `sample.oob.fastq.gz`, e.g., for cross-validation or the .632+ estimator. Without replacement, this yields complementary train/test splits:
+Also save the out-of-bag reads (the reads that were not drawn, about 36.8% of the library for a full-size bootstrap) of each replicate to `sample.oob.fastq.gz`, e.g., for cross-validation with the .632+ estimator. Without replacement, this yields complementary train/test splits:
 ```bash
 fastQpick -f 1 --oob sample.fastq.gz
 ```
 
-Write each sampled read once, with its multiplicity recorded in the header as `;size=<count>` (the USEARCH/VSEARCH abundance convention), instead of writing duplicate records. A full-size bootstrap replicate then contains about 63% as many records:
+Write each sampled read once, with its multiplicity recorded in the header as `;size=<count>` (the USEARCH/VSEARCH abundance convention), instead of writing duplicate records. A full-size bootstrap replicate then contains about 63.2% as many records, and duplication-aware tools can process each distinct read once. By default, duplicates are written as ordinary records, so any downstream tool runs unchanged:
 ```bash
 fastQpick -f 1 --collapse-duplicates sample.fastq.gz
 ```
@@ -81,8 +81,8 @@ fastQpick -f 1 -n 20 -t 8 sample.fastq.gz
 
 | Mode | Flag | Output size | Peak memory (500M reads, `-f 1`, one replicate) | Reads a pipe | When to use |
 |---|---|---|---|---|---|
-| Default | (none) | exact | ~0.6 GB (~1.2 bytes/read) | no | An exact number of output reads is required, and the input is a file. |
-| Single-pass | `-p` / `--single-pass` | exact in expectation | ~0.15 GB (constant) | yes | The input is a stream, or it is gzipped and you would rather not decompress it twice, or minimal memory matters more than an exact output size (relative standard deviation `1/sqrt(fraction * n)`). |
+| Default | (none) | exact (`floor(fraction * n)` reads) | ~0.61 GB (~1.2 bytes/read) | no | Most cases, including multiple replicates (`-n`) and uncompressed input. |
+| Single-pass | `-p` / `--single-pass` | exact only in expectation | ~0.15 GB (constant) | yes | The input is a stream, or a single sample is drawn from a gzipped file and a slight variation in output size (relative standard deviation at most `1/sqrt(fraction * n)`; a 95% interval of about ±43,800 reads around 500 million at `-f 1`) is acceptable in exchange for a faster runtime and lower memory. |
 
 ```bash
 fastQpick -f 1 sample.fastq.gz                  # exact size, two passes
@@ -107,9 +107,12 @@ Streaming is only available with `--single-pass`, only for a single input, and c
 with file grouping (`-g`), since each member of a group needs its own stream. fastQpick reports
 an error rather than sampling incorrectly if any of these is violated.
 
-On a gzipped library this is also the cheaper mode even when memory is plentiful: the two-pass
-mode decompresses the whole file twice, which on a 500-million-read library costs about ten
-minutes of CPU per extra pass.
+On a single gzipped library, single-pass mode is also faster because the default mode decompresses
+the file twice: a full-size bootstrap replicate of a 500-million-read library takes about 31 minutes
+in the default mode and about 22 minutes in single-pass mode. The difference diminishes when several
+replicates are generated in one call, since the counting pass is paid once rather than once per
+replicate (about 85 versus 81 minutes for 10 replicates), and on uncompressed input the two modes
+take almost the same time.
 
 ### Python API
 
@@ -181,10 +184,10 @@ Two Jupyter notebooks in [`notebooks/`](notebooks/) walk through `fastQpick` end
 
 ## Features
 
-- Time efficient - streams through the fastq and writes output in batches - generates a full-size (fraction=1, with replacement) bootstrap replicate of a 500M-read FASTQ in ~31 minutes in standard mode and ~22 minutes in single-pass mode (see [Benchmark](#benchmark) below).
-- Memory efficient - the occurrence vector is sized to the largest per-read count actually drawn (one byte per read in the common case) and filled block by block, so neither the array of sampled indices nor a length-n counting temporary is ever materialized.
+- Time efficient - streams through the fastq and writes output in batches - generates a full-size (fraction=1, with replacement) bootstrap replicate of a 500M-read FASTQ in ~31 minutes with ~0.61 GB of peak memory in the default mode and ~22 minutes with ~0.15 GB in single-pass mode (see [Benchmark](#benchmark) below).
+- Memory efficient - when fewer than 1% of the reads are sampled, the sampled indices are stored in a hash-based counter; otherwise the occurrence vector is sized to the largest per-read count actually drawn (one byte per read in the common case) and filled block by block, so neither the array of sampled indices nor a length-n counting temporary is ever materialized.
 - Optional out-of-bag output (`--oob`) and multiplicity-tagged, duplicate-free output (`--collapse-duplicates`).
-- Single-threaded by design where it matters: fastQpick never calls BLAS, so on import it pins the OpenBLAS pool bundled with numpy to one thread (`OPENBLAS_NUM_THREADS=1`, unless already set), which otherwise starts one busy-waiting thread per core in every process.
+- No idle BLAS threads: fastQpick never calls BLAS, so on import it pins the OpenBLAS pool bundled with numpy to one thread (`OPENBLAS_NUM_THREADS=1`, unless already set), which otherwise starts one busy-waiting thread per core in every process.
 - Gzip-compressed output by default, using the ISA-L-accelerated [`isal`](https://github.com/pycompression/python-isal) library to keep compression from bottlenecking the write pass. Pass `--disable-gzip` (CLI) or `disable_gzip=True` (Python API) to write plain FASTQ instead.
 
 ---
