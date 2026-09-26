@@ -37,6 +37,9 @@ dependencies = [
     "isal>=1.0.0",
 ]
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]  # MCP server (fastQpick-mcp); requires Python >= 3.10
+
 [project.urls]
 "Homepage" = "https://github.com/pachterlab/fastQpick"
 
@@ -50,3 +53,4 @@ fastQpick = ["*.txt", "*.md", "*.csv"]  # Ensure additional files like data or d
 [project.scripts]
 fastQpick = "fastQpick.main:main"  # This replaces the console_scripts entry
 fastqpick = "fastQpick.main:main"  # lowercase alias
+fastQpick-mcp = "fastQpick.mcp_server:main"  # MCP server, needs the [mcp] extra

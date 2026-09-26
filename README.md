@@ -146,6 +146,23 @@ fastQpick(
 )
 ```
 
+### MCP server (LLM agents)
+
+fastQpick ships a [Model Context Protocol](https://modelcontextprotocol.io) server so that LLM agents (Claude Code, Claude Desktop, Cursor, Codex, ...) can sample FASTQ files directly. It requires Python 3.10 or later:
+```bash
+pip install "fastQpick[mcp]"
+```
+
+The server exposes three tools: `sample_fastq` (the full set of options above), `count_fastq_reads` (read counts to pass back as `read_counts`), and `list_fastq_files` (the order in which a directory's files are grouped). Paths refer to the machine running the server. To register it with Claude Code:
+```bash
+claude mcp add fastqpick -- fastQpick-mcp
+```
+or, for any client that reads a JSON configuration:
+```json
+{"mcpServers": {"fastqpick": {"command": "fastQpick-mcp"}}}
+```
+Each sampling call runs the fastQpick command line in its own process and returns the output file paths and the end of the log. Streaming from standard input is not available through the server.
+
 ### Example: bootstrap standard errors for a quantification pipeline
 
 ```bash
