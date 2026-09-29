@@ -1,8 +1,9 @@
+import argparse
 import os
 import tempfile
 import pytest
 from fastQpick import fastQpick
-from fastQpick.utils import read_fastq, count_reads, parse_seed
+from fastQpick.utils import read_fastq, count_reads
 from fastQpick.main import insert_seed_suffix
 from pdb import set_trace as st
 
@@ -263,52 +264,6 @@ def test_default_mode_is_reproducible(temp_large_fastq_file):
         base = os.path.basename(temp_large_fastq_file)
         with open(os.path.join(dir1, base)) as f1, open(os.path.join(dir2, base)) as f2:
             assert f1.read() == f2.read(), "default-mode output must be deterministic for a fixed seed"
-
-
-def test_parse_seed():
-    # single int / single token string
-    assert parse_seed(42) == [42]
-    assert parse_seed("42") == [42]
-    assert parse_seed("1-5") == [1, 2, 3, 4, 5]
-    assert parse_seed("7-7") == [7]
-    assert parse_seed(" 3 - 4 ") == [3, 4]
-
-    # iterables of mixed ints and range strings
-    assert parse_seed([42, 43, 44]) == [42, 43, 44]
-    assert parse_seed(["42", "43"]) == [42, 43]
-    assert parse_seed([1, 2, "5-7"]) == [1, 2, 5, 6, 7]
-    assert parse_seed((1, "3-4")) == [1, 3, 4]
-    assert parse_seed(range(1, 4)) == [1, 2, 3]
-
-    with pytest.raises(ValueError):
-        parse_seed("5-1")  # end less than start
-    with pytest.raises(ValueError):
-        parse_seed("a-b")  # non-integer range
-    with pytest.raises(ValueError):
-        parse_seed("foo")  # non-integer seed
-    with pytest.raises(ValueError):
-        parse_seed("42,43,44")  # comma syntax no longer supported
-
-def test_seed_range_produces_multiple_outputs(temp_fastq_file):
-    fraction = 0.6
-    seed = "1-3"
-    gzip_output = False
-
-    with tempfile.TemporaryDirectory() as temp_output_dir:
-        fastQpick(input_files=temp_fastq_file,
-                fraction=fraction,
-                seed=seed,
-                output_dir=temp_output_dir,
-                disable_gzip=not gzip_output,
-                file_group_size=1,
-                without_replacement=True,
-                overwrite=True
-                )
-
-        # One distinct output file per seed should be present, suffixed with the seed
-        output_files = sorted(f for f in os.listdir(temp_output_dir) if f.endswith(".fastq"))
-        expected = sorted(insert_seed_suffix(os.path.basename(temp_fastq_file), s) for s in (1, 2, 3))
-        assert output_files == expected, f"Expected {expected}, got {output_files}"
 
 
 def test_num_samples_produces_multiple_outputs(temp_fastq_file):
@@ -824,7 +779,7 @@ def test_output_independent_of_threads(tmp_path, temp_large_paired_fastq_files, 
     for threads in (1, 3, 8):
         fresh_length_dict.fastq_to_length_dict.clear()
         out_dir = tmp_path / f"t{threads}"
-        fastQpick(input_files=temp_large_paired_fastq_files, fraction=1.0, seed="1-3", file_group_size=2,
+        fastQpick(input_files=temp_large_paired_fastq_files, fraction=1.0, seed=1, num_samples=3, file_group_size=2,
                   output_dir=str(out_dir), threads=threads, disable_gzip=disable_gzip, overwrite=True, verbose=False, **mode)
         opener = open if disable_gzip else _gzip.open
         outputs[threads] = {name: opener(out_dir / name, "rb").read() for name in sorted(os.listdir(out_dir)) if ".fastq" in name}
@@ -832,18 +787,19 @@ def test_output_independent_of_threads(tmp_path, temp_large_paired_fastq_files, 
     assert outputs[1] == outputs[3] == outputs[8]
 
 
-def test_resolve_threads(monkeypatch):
-    import fastQpick.main as main_module
-    monkeypatch.setattr(main_module, "available_cpus", lambda: 88)
-    assert main_module.resolve_threads(None) == 4
-    assert main_module.resolve_threads(16) == 16  # explicit values are not capped
-    monkeypatch.setattr(main_module, "available_cpus", lambda: 2)
-    assert main_module.resolve_threads(None) == 2
+@pytest.mark.parametrize("bad", [dict(threads=0), dict(threads=-2), dict(num_samples=0), dict(file_group_size=0),
+                                 dict(fraction=0), dict(fraction=-0.5), dict(fraction="abc")])
+def test_invalid_arguments_rejected(tmp_path, temp_large_fastq_file, bad):
+    args = dict(input_files=temp_large_fastq_file, fraction=0.5, output_dir=str(tmp_path / "out"), overwrite=True, verbose=False)
+    args.update(bad)
+    with pytest.raises(ValueError, match=next(iter(bad))):
+        fastQpick(**args)
+    assert not (tmp_path / "out").exists()  # rejected before anything is written
 
 
-def test_invalid_threads_rejected(tmp_path, temp_large_fastq_file):
-    with pytest.raises(ValueError, match="threads"):
-        fastQpick(input_files=temp_large_fastq_file, fraction=0.5, output_dir=str(tmp_path / "out"), threads=0, overwrite=True, verbose=False)
+def test_fraction_is_required(tmp_path, temp_large_fastq_file):
+    with pytest.raises(ValueError, match="fraction"):
+        fastQpick(input_files=temp_large_fastq_file, output_dir=str(tmp_path / "out"), verbose=False)
 
 
 def test_openblas_threads_pinned_on_import():
@@ -854,3 +810,26 @@ def test_openblas_threads_pinned_on_import():
     code = "import fastQpick, os; print(os.environ.get('OPENBLAS_NUM_THREADS'))"
     assert subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True).stdout.strip() == "1"
     assert subprocess.run([sys.executable, "-c", code], env={**env, "OPENBLAS_NUM_THREADS": "8"}, capture_output=True, text=True, check=True).stdout.strip() == "8"
+
+
+def test_seed_none_is_unseeded(tmp_path, temp_large_fastq_file, fresh_length_dict):
+    # seed=None draws fresh entropy: two runs differ, and multiple replicates are labeled by index.
+    outputs = []
+    for run in range(2):
+        fresh_length_dict.fastq_to_length_dict.clear()
+        out_dir = tmp_path / f"run{run}"
+        fastQpick(input_files=temp_large_fastq_file, fraction=0.5, seed=None, num_samples=2,
+                  output_dir=str(out_dir), disable_gzip=True, overwrite=True, verbose=False)
+        names = sorted(os.listdir(out_dir))
+        base = os.path.basename(temp_large_fastq_file)
+        assert [n for n in names if n.endswith(".fastq")] == sorted(insert_seed_suffix(base, None, i) for i in (0, 1))
+        outputs.append(open(out_dir / insert_seed_suffix(base, None, 0), "rb").read())
+    assert outputs[0] != outputs[1], "seed=None must not reproduce the same sample"
+
+
+def test_cli_seed_none():
+    from fastQpick.main import parse_seed
+    assert parse_seed("None") is None and parse_seed("none") is None
+    assert parse_seed("7") == 7
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_seed("1-3")

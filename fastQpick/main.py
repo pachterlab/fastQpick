@@ -9,12 +9,12 @@ from tqdm import tqdm
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
 from pydantic import ConfigDict, Field, validate_call
-from typing import Union
+from typing import Annotated, Union
 import pyfastx  # to loop through fastq (faster than custom python code)
 
 from fastQpick import logger
 from fastQpick._version import __version__
-from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, group_items, count_reads, parse_seed, available_cpus
+from fastQpick.utils import save_params_to_config_file, is_directory_effectively_empty, group_items, count_reads
 
 try:
     from isal import igzip as gzip
@@ -352,16 +352,17 @@ def insert_suffix(filename, suffix):
             return f"{filename[:-len(ext)]}.{suffix}{ext}"
     return f"{filename}.{suffix}"
 
-def insert_seed_suffix(filename, seed):
-    # Per-seed marker, so that distinct seeds write to distinct output files instead of overwriting one another.
-    return insert_suffix(filename, f"seed{seed}")
+def insert_seed_suffix(filename, seed, replicate=0):
+    # Per-replicate marker, so that distinct replicates write to distinct output files instead of
+    # overwriting one another. Unseeded replicates (seed=None) are labeled by 1-based replicate index.
+    return insert_suffix(filename, f"seed{seed}" if seed is not None else f"rep{replicate + 1}")
 
-def resolve_output_path(file, output_directory, gzip_output, multiple_seeds, seed):
+def resolve_output_path(file, output_directory, gzip_output, multiple_seeds, seed, replicate=0):
     # Build the per-file output path, disambiguating by seed when needed and forcing the
     # extension to match the requested gzip setting.
     output_basename = "stdin.fastq" if file == STDIN_SENTINEL else os.path.basename(file)
     if multiple_seeds:  # disambiguate output files when more than one seed is sampled
-        output_basename = insert_seed_suffix(output_basename, seed)
+        output_basename = insert_seed_suffix(output_basename, seed, replicate)
     output_path = os.path.join(output_directory, output_basename)
     if output_directory:
         os.makedirs(output_directory, exist_ok=True)
@@ -372,7 +373,7 @@ def resolve_output_path(file, output_directory, gzip_output, multiple_seeds, see
         output_path = output_path[:-3]
     return output_path
 
-def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_output_threads):
+def two_pass_write_jobs(file_list, fraction, seed, replicate, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_output_threads):
     # Lazily yield (callable, kwargs) write jobs for one seed. Each group's occurrence list is built
     # HERE, in the parent process, so the shared `rng` is consumed in exactly the same order as the
     # single-process path; only the I/O-bound write_fastq call is handed off as a job. This keeps the
@@ -387,11 +388,11 @@ def two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacem
         occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, rng=rng, verbose=verbose)
 
         for member in files_total:
-            output_path = resolve_output_path(member, output, gzip_output, multiple_seeds, seed)
+            output_path = resolve_output_path(member, output, gzip_output, multiple_seeds, seed, replicate)
             oob_path = insert_suffix(output_path, "oob") if oob else None
             yield write_fastq, dict(input_fastq=member, output_path=output_path, occurrence_list=occurrence_list, total_reads=total_reads, gzip_output=gzip_output, seed=seed, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob_path=oob_path, verbose=verbose, gzip_threads=gzip_threads)
 
-def bootstrap_single_file_single_pass(files_total = None, child_seed = None, gzip_output = None, output_directory = None, seed = None, fraction = None, replacement = None, unique_headers = False, collapse_duplicates = False, oob = False, multiple_seeds = False, verbose=True, gzip_threads=gzip_output_threads):
+def bootstrap_single_file_single_pass(files_total = None, child_seed = None, gzip_output = None, output_directory = None, seed = None, replicate = 0, fraction = None, replacement = None, unique_headers = False, collapse_duplicates = False, oob = False, multiple_seeds = False, verbose=True, gzip_threads=gzip_output_threads):
     # Single-pass counterpart of bootstrap_single_file. No occurrence vector is materialized and the
     # file length is never counted; every member of the group is written from the same child_seed
     # so their sampled multiplicities match read-for-read, keeping mate pairs synchronized.
@@ -399,7 +400,7 @@ def bootstrap_single_file_single_pass(files_total = None, child_seed = None, gzi
         files_total = (files_total, )
 
     for file in files_total:
-        output_path = resolve_output_path(file, output_directory, gzip_output, multiple_seeds, seed)
+        output_path = resolve_output_path(file, output_directory, gzip_output, multiple_seeds, seed, replicate)
         oob_path = insert_suffix(output_path, "oob") if oob else None
 
         write_fastq_single_pass(input_fastq = file, output_path = output_path, fraction = fraction, replacement = replacement, child_seed = child_seed, gzip_output = gzip_output, seed = seed, unique_headers = unique_headers, collapse_duplicates = collapse_duplicates, oob_path = oob_path, verbose = verbose, gzip_threads = gzip_threads)
@@ -426,14 +427,6 @@ def run_write_jobs(jobs, max_workers):
         for future in in_flight:
             future.result()
 
-def resolve_threads(threads):
-    # An explicit thread count is honored as given. The default is a small fixed budget, as in most
-    # bioinformatics tools, so that an unconfigured run neither monopolizes a shared node nor varies
-    # with the machine; it is lowered on machines with fewer cores than that.
-    if threads is None:
-        return min(default_threads, available_cpus())
-    return threads
-
 def split_thread_budget(threads, num_jobs):
     # Divide a total thread budget between parallel write jobs and the deflate threads inside each
     # job. Each worker spends one thread on its record loop (which holds the GIL), and whatever is
@@ -445,7 +438,7 @@ def split_thread_budget(threads, num_jobs):
     return workers, gzip_threads
 
 def single_pass_jobs_all_seeds(file_list, seed_list, output, gzip_output, fraction, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, verbose, gzip_threads):
-    for seed in seed_list:
+    for replicate, seed in enumerate(seed_list):
         # Derive one independent sub-seed per group from the master seed. Members of a group share
         # their sub-seed (handled inside bootstrap_single_file_single_pass) so mates stay synchronized,
         # while different groups draw independently, mirroring the two-pass path where each file
@@ -453,21 +446,20 @@ def single_pass_jobs_all_seeds(file_list, seed_list, output, gzip_output, fracti
         # parallel write job.
         child_seeds = np.random.SeedSequence(seed).spawn(len(file_list))
         for file, child_seed in zip(file_list, child_seeds):
-            yield bootstrap_single_file_single_pass, dict(files_total=file, child_seed=child_seed, gzip_output=gzip_output, output_directory=output, seed=seed, fraction=fraction, replacement=replacement, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob=oob, multiple_seeds=multiple_seeds, verbose=verbose, gzip_threads=gzip_threads)
+            yield bootstrap_single_file_single_pass, dict(files_total=file, child_seed=child_seed, gzip_output=gzip_output, output_directory=output, seed=seed, replicate=replicate, fraction=fraction, replacement=replacement, unique_headers=unique_headers, collapse_duplicates=collapse_duplicates, oob=oob, multiple_seeds=multiple_seeds, verbose=verbose, gzip_threads=gzip_threads)
 
 def two_pass_jobs_all_seeds(file_list, seed_list, fraction, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, verbose, gzip_threads):
-    for seed in seed_list:
+    for replicate, seed in enumerate(seed_list):
         # Seed a numpy Generator once per seed. A single Generator is shared across the seed's files so
         # that successive files draw independent samples while remaining reproducible. This generator
         # is consumed lazily in the parent, so a seed's RNG is (re)seeded only after every
         # occurrence list of the previous seed has been built; the RNG state each list sees is
         # therefore the same as in a serial run, however the writes are scheduled across processes.
         rng = np.random.default_rng(seed)
-        yield from two_pass_write_jobs(file_list, fraction, seed, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_threads)
+        yield from two_pass_write_jobs(file_list, fraction, seed, replicate, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_threads)
 
-def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, unique_headers, single_pass, verbose, collapse_duplicates=False, oob=False, threads=None):
+def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, unique_headers, single_pass, verbose, collapse_duplicates=False, oob=False, threads=default_threads):
     multiple_seeds = len(seed_list) > 1
-    threads = resolve_threads(threads)
     # Jobs from every seed share one pool, so replicates of a single file run in parallel as well as
     # distinct files. A job is a whole group in single-pass mode (its members re-derive the same
     # multiplicities from a shared sub-seed) and an individual output file in two-pass mode (group
@@ -488,7 +480,7 @@ def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, r
         jobs = two_pass_jobs_all_seeds(**common)
     run_write_jobs(jobs, max_workers=max_workers)
 
-def make_fastq_to_length_dict(file_list, verbose=True, threads=None):
+def make_fastq_to_length_dict(file_list, verbose=True, threads=default_threads):
     # Count the reads of every file (or of the first member of every group; members share its count)
     # that does not already have a count. Counting is I/O- and decompression-bound and each file is
     # independent, so with more than one file to count the files are counted in parallel.
@@ -505,7 +497,7 @@ def make_fastq_to_length_dict(file_list, verbose=True, threads=None):
             for counted, _ in to_count:
                 logger.info(f"Counting {counted}")
         paths = [counted for counted, _ in to_count]
-        max_workers = min(len(paths), resolve_threads(threads))
+        max_workers = min(len(paths), threads)
         if max_workers <= 1:
             counts = [count_reads(path) for path in paths]
         else:
@@ -550,12 +542,12 @@ def apply_read_counts(read_counts, file_list):
 @validate_call
 def fastQpick(
     input_files: str | list | tuple,
-    fraction: float = 1.0,
-    seed: int | str | list = 42,
-    num_samples: int = 1,
+    fraction: Annotated[float, Field(gt=0)],
+    seed: int | None = 42,
+    num_samples: Annotated[int, Field(gt=0)] = 1,
     output_dir: str = "fastQpick_output",
     disable_gzip: bool = False,
-    file_group_size: int = 1,
+    file_group_size: Annotated[int, Field(gt=0)] = 1,
     without_replacement: bool = False,
     overwrite: bool = False,
     no_unique_headers: bool = False,
@@ -563,7 +555,7 @@ def fastQpick(
     collapse_duplicates: bool = False,
     oob: bool = False,
     read_counts: Union[int, list, dict, None] = None,
-    threads: Union[int, None] = None,
+    threads: Annotated[int, Field(gt=0)] = default_threads,
     verbose: bool = True,
     **kwargs
 ):
@@ -574,7 +566,7 @@ def fastQpick(
     ----------
     input_files (str, list, or tuple)       Input FASTQ files or directories containing FASTQ files.
     fraction (int or float)                 The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 turns on sampling with replacement automatically.
-    seed (int)                              Random seed.
+    seed (int or None)                      Random seed. Replicate i (0-based) of num_samples uses seed + i. None draws fresh OS entropy for every replicate, so the output is not reproducible.
     num_samples (int)                       Number of independent samples (replicates) to generate.
     output_dir (str)                        Output directory.
     disable_gzip (bool)                     Write plain (uncompressed) FASTQ. Output is gzip-compressed by default.
@@ -586,7 +578,7 @@ def fastQpick(
     collapse_duplicates (bool)              Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Reduces output size when sampling with replacement. Overrides no_unique_headers.
     oob (bool)                              Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file for each output file.
     read_counts (int, list, or dict)        Number of reads in each input file, to skip the counting pass of the two-pass modes. Either a dict mapping each file path to its read count, or an int / list of ints in input order (after directory expansion), with one count per file or one per group. Ignored when single_pass is True. The writing pass checks each count and raises an error if it does not match the file.
-    threads (int)                           Total number of threads (CPU cores) to use, shared between parallel file/replicate jobs and gzip compression. Defaults to 4, or to the number of available cores if fewer. Output does not depend on this value.
+    threads (int)                           Total number of threads (CPU cores) to use, shared between parallel file/replicate jobs and gzip compression. Defaults to 4. Output does not depend on this value.
     verbose (bool)                          Whether to print progress information.
 
     kwargs
@@ -597,9 +589,6 @@ def fastQpick(
     if unexpected:
         raise TypeError(f"fastQpick() got unexpected keyword argument(s): {', '.join(sorted(unexpected))}")
     replacement = not without_replacement
-    if threads is not None and threads < 1:
-        raise ValueError(f"threads must be a positive integer, got {threads}.")
-    threads = resolve_threads(threads)
     gzip_output = not disable_gzip  # output is gzip-compressed by default
 
     # check if fastq_to_length_dict is in kwargs
@@ -612,17 +601,9 @@ def fastQpick(
         if os.path.exists(output_dir) and not is_directory_effectively_empty(output_dir):  # check if dir exists and is not empty
             raise FileExistsError(f"Output directory '{output_dir}' already exists. Please specify a different output directory or set the overwrite flag to True.")
 
-    # Normalize the seed specification into a flat list of integer seeds. The seed argument doubles as a
-    # (hidden) way to request multiple samples for backwards compatibility: if it expands to more than one
-    # seed (a list or a dash-delimited range string), each seed produces one sample and num_samples is
-    # overridden to match. For a single seed, num_samples consecutive seeds are derived from it so that
-    # num_samples controls the number of independent replicates. With the defaults (seed=42, num_samples=1)
-    # this yields the single seed 42. The user need not be aware of this seed/num_samples interplay.
-    seeds = parse_seed(seed)
-    if len(seeds) > 1:
-        num_samples = len(seeds)
-    else:
-        seeds = list(range(seeds[0], seeds[0] + num_samples))
+    # Replicate i uses seed + i, so num_samples controls the number of independent replicates.
+    # With seed=None each replicate's generator is seeded from fresh OS entropy (not reproducible).
+    seeds = [None] * num_samples if seed is None else list(range(seed, seed + num_samples))
 
     # Save arguments to a config file
     os.makedirs(output_dir, exist_ok=True)
@@ -631,7 +612,7 @@ def fastQpick(
 
     # type checking
     # if fraction >= 1, set replacement to True
-    if float(fraction) >= 1.0:
+    if fraction >= 1.0:
         replacement = True
 
     # go through files, and only keep those that are valid fastq files or that are a folder containing valid fastq files in the direct subdirectory
@@ -662,9 +643,6 @@ def fastQpick(
             raise ValueError(f"File '{path}' is not a valid FASTQ file.")
         elif os.path.isfile(path) and path.endswith(tuple(valid_fastq_extensions)):
             input_files_parsed.append(path)
-
-    file_group_size = int(file_group_size)  # make sure file_group_size is an int (not a string)
-    fraction = float(fraction)  # make sure fraction is a float (not a string)
 
     # Standard input is not seekable and its length is not known in advance, so it is only
     # compatible with the single-pass sampler reading a single, ungrouped stream.
@@ -708,23 +686,45 @@ def parse_read_counts(value):
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid read counts '{value}'. Expected comma-separated integers, e.g. 1000,1000.")
 
+def parse_seed(value):
+    # argparse type for --seed: an integer, or "None" for an unseeded (non-reproducible) run.
+    if value.strip().lower() == "none":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid seed '{value}'. Expected an integer or None.")
+
+def positive_type(cast):
+    # argparse type for options that must be greater than 0 (the Python API enforces the same bound).
+    def parse(value):
+        try:
+            parsed = cast(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid {cast.__name__} value: '{value}'")
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError(f"must be greater than 0, got {value}")
+        return parsed
+    parse.__name__ = cast.__name__
+    return parse
+
 def main():
     # Create argument parser
     parser = argparse.ArgumentParser(description="Fast and memory-efficient sampling of DNA-Seq or RNA-seq fastq data with or without replacement.")
-    parser.add_argument("-f", "--fraction", required=True, default=False, help="The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 turns on sampling with replacement automatically.")
-    parser.add_argument("-s", "--seed", required=False, default=42, nargs="+", help='Random seed.')
-    parser.add_argument("-B", "-n", "--num-samples", required=False, type=int, default=1, help="Number of independent samples (replicates) to generate")
-    parser.add_argument("-o", "--output-dir", required=False, type=str, default="fastQpick_output", help="Output directory.")
+    parser.add_argument("-f", "--fraction", required=True, type=positive_type(float), help="The fraction of reads to sample, as a float greater than 0. Any value equal to or greater than 1 turns on sampling with replacement automatically.")
+    parser.add_argument("-s", "--seed", required=False, type=parse_seed, default=42, help="Random seed. Replicate i (0-based) uses seed + i. Pass None for a non-reproducible run seeded from fresh OS entropy. (default: %(default)s)")
+    parser.add_argument("-B", "-n", "--num-samples", required=False, type=positive_type(int), default=1, help="Number of independent samples (replicates) to generate. (default: %(default)s)")
+    parser.add_argument("-o", "--output-dir", required=False, type=str, default="fastQpick_output", help="Output directory. (default: %(default)s)")
     parser.add_argument("-z", "--disable-gzip", action="store_true", help="Write plain (uncompressed) FASTQ. Output is gzip-compressed by default.")
-    parser.add_argument("-g", "--file-group-size", required=False, default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3.")
-    parser.add_argument("-dr", "--without-replacement", action="store_true", help="Sample without replacement. Automatically disabled if fraction >= 1.")
+    parser.add_argument("-g", "--file-group-size", required=False, type=positive_type(int), default=1, help="The size of grouped files. Provide each pair of files sequentially, separated by a space. E.g., I1, R1, R2 would have file_group_size=3. (default: %(default)s)")
+    parser.add_argument("-r", "--without-replacement", action="store_true", help="Sample without replacement. Automatically disabled if fraction >= 1.")
     parser.add_argument("-w", "--overwrite", action="store_true", help="Overwrite existing output files.")
     parser.add_argument("--no-unique-headers", action="store_true", help="Keep the original read headers when sampling with replacement. By default each repeated read gets a unique suffix (_1, _2, ...). Ignored when sampling without replacement.")
     parser.add_argument("-p", "--single-pass", action="store_true", help="Read the input once instead of twice, using constant memory. The output size is exact only in expectation (relative standard deviation 1/sqrt(fraction * n)). Required to read from standard input.")
     parser.add_argument("-c", "--collapse-duplicates", action="store_true", help='Write each sampled read once and record its multiplicity in the header as ";size=<count>" instead of writing duplicate records. Overrides --no-unique-headers.')
     parser.add_argument("--oob", action="store_true", help='Also write the out-of-bag reads (reads not selected in a sample) to a separate "<name>.oob.fastq[.gz]" file.')
     parser.add_argument("--read-counts", required=False, type=parse_read_counts, default=None, help="Comma-separated number of reads in each input file, in input order (one per file, or one per group with -g), e.g. --read-counts 5725730,5725730. Skips the counting pass. Ignored with --single-pass. An error is raised if a count does not match its file.")
-    parser.add_argument("-t", "--threads", required=False, type=int, default=None, help="Total number of threads to use, shared between parallel file/replicate jobs and gzip compression. Default: 4, or the number of available cores if fewer. Output does not depend on this value.")
+    parser.add_argument("-t", "--threads", required=False, type=positive_type(int), default=default_threads, help="Total number of threads to use, shared between parallel file/replicate jobs and gzip compression. (default: %(default)s) Output does not depend on this value.")
     parser.add_argument("-q", "--quiet", action="store_false", help="Whether to print progress information.")
     parser.add_argument("-v", "--version", action="version", version=f"fastQpick {__version__}", help="Show program's version number and exit")
 

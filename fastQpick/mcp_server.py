@@ -13,7 +13,7 @@ import multiprocessing
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
-from typing import List, Optional, Union
+from typing import List, Optional
 
 from fastQpick._version import __version__
 
@@ -66,10 +66,9 @@ def build_cli_args(input_files, fraction, output_dir, num_samples, seed, without
                    file_group_size, single_pass, disable_gzip, collapse_duplicates, oob,
                    no_unique_headers, read_counts, threads, overwrite):
     args = ["-f", str(fraction), "-o", output_dir, "-n", str(num_samples), "-g", str(file_group_size)]
-    if seed is not None:
-        args += ["-s", str(seed)]
+    args += ["-s", str(seed)]  # str(None) == "None", which the CLI reads as an unseeded run
     if without_replacement:
-        args.append("-dr")
+        args.append("-r")
     if single_pass:
         args.append("-p")
     if disable_gzip:
@@ -93,10 +92,10 @@ def build_cli_args(input_files, fraction, output_dir, num_samples, seed, without
 @server.tool()
 async def sample_fastq(
     input_files: List[str],
-    fraction: float = 1.0,
+    fraction: float,
     output_dir: str = "fastQpick_output",
     num_samples: int = 1,
-    seed: Union[int, str] = 42,
+    seed: Optional[int] = 42,
     without_replacement: bool = False,
     file_group_size: int = 1,
     single_pass: bool = False,
@@ -105,7 +104,7 @@ async def sample_fastq(
     oob: bool = False,
     no_unique_headers: bool = False,
     read_counts: Optional[List[int]] = None,
-    threads: Optional[int] = None,
+    threads: int = 4,
     overwrite: bool = False,
 ) -> dict:
     """Sample reads from FASTQ files with or without replacement and write the samples to output_dir.
@@ -117,8 +116,8 @@ async def sample_fastq(
         output_dir: Output directory. Must be empty or absent unless overwrite is true.
         num_samples: Number of independent replicates. Replicate i uses seed + i and is written as
             <name>.seed<seed>.fastq[.gz] when more than one replicate is requested.
-        seed: Random seed, or a comma-separated list / dash range string (e.g. "1-10"), which
-            then sets the number of replicates. Output is reproducible for a fixed seed.
+        seed: Random seed. Output is reproducible for a fixed seed. None seeds every replicate from
+            fresh OS entropy (not reproducible); multiple replicates are then written as <name>.rep<i>.fastq[.gz].
         without_replacement: Subsample without replacement (ignored when fraction >= 1).
         file_group_size: Number of consecutive input files that form one library (2 for R1/R2,
             3 for I1/R1/R2). Mates are sampled at the same read indices.
@@ -130,7 +129,7 @@ async def sample_fastq(
         no_unique_headers: Keep original headers for repeated reads instead of adding _1, _2, ...
         read_counts: Known read count per file (or per group), in input order, to skip the counting
             pass. A wrong count raises an error rather than biasing the sample.
-        threads: Total thread budget (default: 4, or fewer if fewer cores are available).
+        threads: Total thread budget (default: 4).
         overwrite: Allow writing into a non-empty output_dir.
 
     Returns:

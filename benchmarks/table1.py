@@ -150,9 +150,9 @@ def commands(args, outdir):
         ("bootstrap", "fastQpick_single_pass"):
             (f"{fq} -f 1 -p -s {SEED} -t {t1} -o {outdir} -w -q {inp}", True),
         ("subsample20", "fastQpick_default"):
-            (f"{fq} -f {SUBSAMPLE_FRACTION} -dr -z -s {SEED} -t {t1} -o {outdir} -w -q {inp}", False),
+            (f"{fq} -f {SUBSAMPLE_FRACTION} -r -z -s {SEED} -t {t1} -o {outdir} -w -q {inp}", False),
         ("subsample20", "fastQpick_single_pass"):
-            (f"{fq} -f {SUBSAMPLE_FRACTION} -dr -p -z -s {SEED} -t {t1} -o {outdir} -w -q {inp}", False),
+            (f"{fq} -f {SUBSAMPLE_FRACTION} -r -p -z -s {SEED} -t {t1} -o {outdir} -w -q {inp}", False),
         ("subsample20", "seqtk"):
             (f"{args.seqtk} sample -s {SEED} {inp} {SUBSAMPLE_FRACTION} > {outdir}/out.fastq", False),
         ("subsample20", "seqkit"):

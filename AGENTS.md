@@ -14,7 +14,7 @@ pip install -e ".[mcp]"       # plus the MCP server (Python >= 3.10)
 pytest tests/                 # full test suite (fast; fixtures are small)
 pytest tests/test_fastQpick.py::test_single_file   # one test
 python -m build               # wheel + sdist
-fastQpick -f 0.1 -dr input.fastq                   # CLI
+fastQpick -f 0.1 -r input.fastq                   # CLI
 fastQpick-mcp                 # MCP server on stdio
 ```
 
@@ -25,7 +25,7 @@ There is no linter or formatter configured. Match the style of the surrounding c
 | Path | Contents |
 |---|---|
 | `fastQpick/main.py` | The whole pipeline: `fastQpick()` (single entry point for the CLI and the Python API), both samplers, the writers, and the argparse `main()`. |
-| `fastQpick/utils.py` | Stateless helpers (read counting, seed parsing, file grouping, config snapshot). |
+| `fastQpick/utils.py` | Stateless helpers (read counting, file grouping, config snapshot). |
 | `fastQpick/mcp_server.py` | MCP server (`fastQpick-mcp`), a thin wrapper that runs the CLI in a subprocess. |
 | `fastQpick/__init__.py` | Package logger; pins `OPENBLAS_NUM_THREADS=1` before numpy is imported. |
 | `tests/` | End-to-end tests on temporary FASTQ fixtures. |
@@ -47,7 +47,7 @@ Tests guard most of these. Read the relevant code before changing sampling logic
 
 - Grouped files (`file_group_size > 1`, e.g. R1/R2 or I1/R1/R2) share one occurrence list (two-pass) or one spawned `SeedSequence` sub-seed (single-pass), so mates stay synchronized. Grouped files must have equal read counts.
 - `fraction >= 1` forces sampling with replacement.
-- Reproducibility: output is byte-identical for a fixed seed. Two-pass mode uses one `np.random.default_rng(seed)` per seed, consumed in a fixed serial order. Do not use the global `np.random` or the stdlib `random` module.
+- Reproducibility: output is byte-identical for a fixed seed (default 42). `seed=None` (CLI `-s None`) seeds from fresh OS entropy and is intentionally non-reproducible; its replicates are suffixed `.rep<i>` rather than `.seed<k>`. Two-pass mode uses one `np.random.default_rng(seed)` per seed, consumed in a fixed serial order. Do not use the global `np.random` or the stdlib `random` module.
 - `make_occurrence_list` memory behavior:
   - The dense occurrence vector is filled block by block (`occurrence_block_size`), with block totals from `rng.multinomial` (with replacement) or `rng.hypergeometric` (without). Do not materialize the length-`m` index array or a length-`n` bincount temporary, and do not use `np.add.at` or `random.sample`.
   - A `Counter` is used instead of a dense array only when the sample is very sparse (`m < n / counter_sparsity_threshold`).
