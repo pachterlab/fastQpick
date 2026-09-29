@@ -833,3 +833,66 @@ def test_cli_seed_none():
     assert parse_seed("7") == 7
     with pytest.raises(argparse.ArgumentTypeError):
         parse_seed("1-3")
+
+
+# --- regression tests for edge cases ------------------------------------------------
+
+def _write_fastq(path, names):
+    with open(path, "w") as f:
+        for name in names:
+            f.write(f"@{name}\nACGT\n+\nIIII\n")
+
+
+def test_reads_to_sample_is_exact_floor():
+    from fastQpick.main import reads_to_sample
+    assert int(0.29 * 100) == 28  # the floating-point product this guards against
+    assert reads_to_sample(0.29, 100) == 29
+    assert reads_to_sample(0.57, 100) == 57
+    assert reads_to_sample(0.5, 3) == 1
+    assert reads_to_sample(2, 7) == 14
+
+
+def test_fraction_with_inexact_binary_product(tmp_path):
+    _write_fastq(tmp_path / "in.fastq", [f"r{i}" for i in range(100)])
+    fastQpick(str(tmp_path / "in.fastq"), fraction=0.29, without_replacement=True, disable_gzip=True,
+              output_dir=str(tmp_path / "out"), verbose=False)
+    assert count_reads(str(tmp_path / "out" / "in.fastq")) == 29
+
+
+def test_unique_headers_count_at_dtype_max(tmp_path):
+    # A dense uint8 count of 255 must not wrap to 0 when computing the unique-header suffixes.
+    import numpy as np
+    from fastQpick.main import write_fastq
+    _write_fastq(tmp_path / "in.fastq", ["a", "b"])
+    occurrence = np.array([255, 1], dtype=np.uint8)
+    for collapse_or_oob in (False, True):
+        out = tmp_path / f"out{collapse_or_oob}.fastq"
+        write_fastq(str(tmp_path / "in.fastq"), str(out), occurrence, 2, gzip_output=False, unique_headers=True,
+                    oob_path=str(tmp_path / "oob.fastq") if collapse_or_oob else None, verbose=False)
+        assert count_reads(str(out)) == 256
+
+
+def test_empty_occurrence_list():
+    import numpy as np
+    from fastQpick.main import make_occurrence_list
+    for replacement in (True, False):
+        occ = make_occurrence_list("f", 0, 0, 0, replacement, np.random.default_rng(0), verbose=False)
+        assert len(occ) == 0
+
+
+def test_output_would_overwrite_input(tmp_path):
+    _write_fastq(tmp_path / "in.fastq", ["a", "b"])
+    before = (tmp_path / "in.fastq").read_text()
+    with pytest.raises(ValueError, match="overwrite the input"):
+        fastQpick(str(tmp_path / "in.fastq"), fraction=1, disable_gzip=True, output_dir=str(tmp_path),
+                  overwrite=True, verbose=False)
+    assert (tmp_path / "in.fastq").read_text() == before
+
+
+def test_duplicate_output_basenames_rejected(tmp_path):
+    for d in ("a", "b"):
+        (tmp_path / d).mkdir()
+        _write_fastq(tmp_path / d / "x.fastq", ["a", "b"])
+    with pytest.raises(ValueError, match="distinct names"):
+        fastQpick([str(tmp_path / "a" / "x.fastq"), str(tmp_path / "b" / "x.fastq")], fraction=1,
+                  output_dir=str(tmp_path / "out"), verbose=False)

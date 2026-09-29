@@ -4,6 +4,7 @@ import io
 import itertools
 import os
 import sys
+from decimal import Decimal
 import numpy as np
 from tqdm import tqdm
 from collections import Counter
@@ -117,7 +118,7 @@ def write_reads_tagged(read_count_pairs, f, f_oob, unique_headers, collapse_dupl
             if collapse_duplicates:
                 buffer.append(f"@{name};size={count}\n{seq}\n+\n{qual}\n")
             elif unique_headers:
-                buffer.extend([f"@{name}_{j}\n{seq}\n+\n{qual}\n" for j in range(1, count+1)])
+                buffer.extend([f"@{name}_{j}\n{seq}\n+\n{qual}\n" for j in range(1, int(count)+1)])
             else:
                 buffer.append(f"@{name}\n{seq}\n+\n{qual}\n" * int(count))
         elif f_oob is not None:
@@ -176,8 +177,9 @@ def write_fastq(input_fastq, output_path, occurrence_list, total_reads, gzip_out
                         buffer.clear()  # Clear the buffer after writing
             else:  # unique headers
                 for i, (name, seq, qual) in enumerate(iterator):
-                    if occurrence_list[i] > 0:  # not strictly necessary for coding logic, but saves time (if 0 > 0 is faster than saying for j in range(0))
-                        buffer.extend([f"@{name}_{j}\n{seq}\n+\n{qual}\n" for j in range(1, occurrence_list[i]+1)])
+                    count = int(occurrence_list[i])  # int() so that count + 1 cannot wrap around in the array's (uint8) dtype
+                    if count > 0:  # not strictly necessary for coding logic, but saves time (if 0 > 0 is faster than saying for j in range(0))
+                        buffer.extend([f"@{name}_{j}\n{seq}\n+\n{qual}\n" for j in range(1, count+1)])
 
                     # If the buffer reaches the batch size, write all at once and clear the buffer
                     if (i + 1) % batch_size == 0:
@@ -299,6 +301,9 @@ def make_occurrence_list(file, seed, total_reads, number_of_reads_to_sample, rep
 
     n, m = total_reads, number_of_reads_to_sample
 
+    if n == 0:
+        return np.zeros(0, dtype=np.uint8)
+
     if m < n / counter_sparsity_threshold:
         # Sparse case: the m sampled indices are few, so they are drawn at once and counted in a Counter.
         if replacement:
@@ -373,6 +378,11 @@ def resolve_output_path(file, output_directory, gzip_output, multiple_seeds, see
         output_path = output_path[:-3]
     return output_path
 
+def reads_to_sample(fraction, total_reads):
+    # floor(fraction * total_reads), computed in decimal so that binary rounding of the fraction
+    # does not drop a read (in floating point, int(0.29 * 100) == 28).
+    return int(Decimal(repr(float(fraction))) * total_reads)
+
 def two_pass_write_jobs(file_list, fraction, seed, replicate, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_output_threads):
     # Lazily yield (callable, kwargs) write jobs for one seed. Each group's occurrence list is built
     # HERE, in the parent process, so the shared `rng` is consumed in exactly the same order as the
@@ -383,7 +393,7 @@ def two_pass_write_jobs(file_list, fraction, seed, replicate, output, gzip_outpu
         files_total = (file, ) if isinstance(file, str) else file
 
         total_reads = fastq_to_length_dict[files_total[0]]
-        number_of_reads_to_sample = int(fraction * total_reads)
+        number_of_reads_to_sample = reads_to_sample(fraction, total_reads)
 
         occurrence_list = make_occurrence_list(file=files_total[0], seed=seed, total_reads=total_reads, number_of_reads_to_sample=number_of_reads_to_sample, replacement=replacement, rng=rng, verbose=verbose)
 
@@ -457,6 +467,29 @@ def two_pass_jobs_all_seeds(file_list, seed_list, fraction, output, gzip_output,
         # therefore the same as in a serial run, however the writes are scheduled across processes.
         rng = np.random.default_rng(seed)
         yield from two_pass_write_jobs(file_list, fraction, seed, replicate, output, gzip_output, replacement, unique_headers, collapse_duplicates, oob, multiple_seeds, rng, verbose, gzip_threads=gzip_threads)
+
+def check_output_paths(file_list, seed_list, output_directory, gzip_output, oob):
+    # Every output file must be distinct and must not be one of the inputs. Two inputs with the same
+    # basename in different directories would otherwise write to one output path (concurrently, in
+    # parallel runs), and an output directory that holds the inputs could truncate an input before
+    # it is read.
+    input_paths = {os.path.realpath(member) for file in file_list
+                   for member in ((file,) if isinstance(file, str) else file) if member != STDIN_SENTINEL}
+    multiple_seeds = len(seed_list) > 1
+    seen = {}
+    for replicate, seed in enumerate(seed_list):
+        for file in file_list:
+            for member in ((file,) if isinstance(file, str) else file):
+                output_path = resolve_output_path(member, output_directory, gzip_output, multiple_seeds, seed, replicate)
+                for path in (output_path, insert_suffix(output_path, "oob")) if oob else (output_path,):
+                    real_path = os.path.realpath(path)
+                    if real_path in input_paths:
+                        raise ValueError(f"Output file '{path}' would overwrite the input file it is sampled from. "
+                                         "Choose a different output directory.")
+                    if real_path in seen and seen[real_path] != member:
+                        raise ValueError(f"Input files '{seen[real_path]}' and '{member}' would both be written to "
+                                         f"'{path}'. Input files must have distinct names.")
+                    seen[real_path] = member
 
 def sample_multiple_files(file_list, fraction, seed_list, output, gzip_output, replacement, unique_headers, single_pass, verbose, collapse_duplicates=False, oob=False, threads=default_threads):
     multiple_seeds = len(seed_list) > 1
@@ -663,6 +696,9 @@ def fastQpick(
     # Headers are made unique only for reads that can repeat, i.e. with replacement. Collapsed
     # output writes each read once, so its header is already unique.
     unique_headers = replacement and not no_unique_headers and not collapse_duplicates
+
+    # Fail before the (possibly long) counting pass if two outputs collide or an output is an input
+    check_output_paths(input_files_parsed, seeds, output_dir, gzip_output, oob)
 
     # Count reads in each file and store in a dictionary. The single-pass sampler does not need the
     # counts, so this pass is skipped entirely in that mode. Files with a user-supplied count are
